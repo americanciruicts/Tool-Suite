@@ -1,3 +1,25 @@
+# Node
+node_modules/
+.next/
+.turbo/
+out/
+
+# Python
+__pycache__/
+.pytest_cache/
+.venv/
+
+# Logs and reports
+logs/
+reports/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.*
 # ========================================
 # BOM Comparison Tool - GitIgnore File
 # ========================================
@@ -96,3 +118,4 @@ htmlcov/
 !tailwind.config.js
 !postcss.config.js
 !docker-compose.yml
+.vercel

@@ -98,6 +98,29 @@ npm run type-check
 npm run build
 ```
 
+## ✅ Final Mile (Security Standards Protocol)
+
+Before any release, complete the Final Mile checks based on `SECURITY_STANDARDS_PROTOCOL.md` (alias: `security_standards.protocol.md`).
+
+Quick start:
+
+```bash
+# Windows
+scripts\final-mile.bat
+
+# Linux/Mac
+bash scripts/final-mile.sh
+```
+
+What runs:
+- Lint and type-check (frontend)
+- Dependency vulnerability audit (Node)
+- Optional: Secrets scan (gitleaks) if installed
+- Optional: Python SAST (bandit) and dependency audit (safety) if installed
+- Optional: k6 performance test (ensure stack is running locally)
+
+See `FINAL_MILE_CHECKLIST.md` for pass/fail criteria and manual verification steps.
+
 ### Docker Services
 - **Frontend**: Next.js on port 3000 (internal)
 - **Backend**: FastAPI on port 8000 (internal) 

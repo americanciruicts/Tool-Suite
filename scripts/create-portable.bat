@@ -61,5 +61,5 @@ echo   1. Zip the 'BOM-Tool-Portable' folder
 echo   2. Send to employees
 echo   3. They extract and run deploy.bat
 echo.
-echo 💡 Each user will need Docker Desktop installed
+echo 💡 Each user will need Docker Desktop installed 
 pause
