@@ -206,9 +206,15 @@ docker-compose down -v && docker system prune -a
 - **API Docs**: http://localhost:8080/api (FastAPI auto-docs)
 - **Logs**: `docker-compose logs [service-name]`
 
+## Owner
+
+**American Circuits Inc.**
+
+Deployed and maintained by **Preet Raval**
+
 ## 📝 License
 
-MIT License - see [LICENSE](LICENSE) file for details.
+Proprietary — American Circuits Inc. Internal use only.
 
 ## 🎯 Roadmap
 
