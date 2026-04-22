@@ -65,6 +65,15 @@ interface ComparisonResults {
   };
 }
 
+// Detect base path for API calls (handles /bom/ tunnel prefix)
+function getApiBasePath(): string {
+  if (typeof window === 'undefined') return '/api';
+  const path = window.location.pathname;
+  // If accessed via /bom/ prefix (tunnel proxy), use /bom/api
+  if (path.startsWith('/bom')) return '/bom/api';
+  return '/api';
+}
+
 export default function Home() {
   const [file1, setFile1] = useState<File | null>(null);
   const [file2, setFile2] = useState<File | null>(null);
@@ -94,36 +103,40 @@ export default function Home() {
   const [pdfProcessing, setPdfProcessing] = useState(false);
   const [pdfError, setPdfError] = useState<string | null>(null);
   const [pdfSuccess, setPdfSuccess] = useState<string | null>(null);
+  // Validate Excel file by extension (MIME types are unreliable across OS/browsers)
+  const isExcelFile = (file: File) => {
+    const name = file.name.toLowerCase();
+    return name.endsWith('.xlsx') || name.endsWith('.xls');
+  };
+
   const onDrop1 = useCallback((acceptedFiles: File[]) => {
-    if (acceptedFiles.length > 0) {
-      setFile1(acceptedFiles[0]);
-      setFileName1(acceptedFiles[0].name); 
+    const file = acceptedFiles[0];
+    if (file && isExcelFile(file)) {
+      setFile1(file);
+      setFileName1(file.name);
+    } else if (file) {
+      setError('Please upload an Excel file (.xlsx or .xls)');
     }
   }, []);
 
   const onDrop2 = useCallback((acceptedFiles: File[]) => {
-    if (acceptedFiles.length > 0) {
-      setFile2(acceptedFiles[0]);
-      setFileName2(acceptedFiles[0].name);
+    const file = acceptedFiles[0];
+    if (file && isExcelFile(file)) {
+      setFile2(file);
+      setFileName2(file.name);
       setError(null);
+    } else if (file) {
+      setError('Please upload an Excel file (.xlsx or .xls)');
     }
   }, []);
 
   const { getRootProps: getRootProps1, getInputProps: getInputProps1, isDragActive: isDragActive1 } = useDropzone({
     onDrop: onDrop1,
-    accept: {
-      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'],
-      'application/vnd.ms-excel': ['.xls'],
-    },
     multiple: false,
   });
 
   const { getRootProps: getRootProps2, getInputProps: getInputProps2, isDragActive: isDragActive2 } = useDropzone({
     onDrop: onDrop2,
-    accept: {
-      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'],
-      'application/vnd.ms-excel': ['.xls'],
-    },
     multiple: false,
   });
 
@@ -158,9 +171,7 @@ export default function Home() {
       const formData = new FormData();
       formData.append('file', pdfFile);
 
-      const apiUrl = process.env.NEXT_PUBLIC_API_URL
-        ? `${process.env.NEXT_PUBLIC_API_URL}/pdf-to-excel`
-        : '/api/pdf-to-excel';
+      const apiUrl = `${getApiBasePath()}/pdf-to-excel`;
 
       const response = await axios.post(apiUrl, formData, {
         headers: {
@@ -234,9 +245,7 @@ export default function Home() {
       formData.append('file1', file1);
       formData.append('file2', file2);
 
-      const apiUrl = process.env.NEXT_PUBLIC_API_URL
-        ? `${process.env.NEXT_PUBLIC_API_URL}/analyze-files`
-        : '/api/analyze-files';
+      const apiUrl = `${getApiBasePath()}/analyze-files`;
 
       const response = await axios.post(apiUrl, formData, {
         headers: {
@@ -309,9 +318,7 @@ export default function Home() {
       formData.append('file2_refdes', selectedColumns.file2.refdes);
       formData.append('file2_description', selectedColumns.file2.description);
 
-      const apiUrl = process.env.NEXT_PUBLIC_API_URL
-        ? `${process.env.NEXT_PUBLIC_API_URL}/compare-manual`
-        : '/api/compare-manual';
+      const apiUrl = `${getApiBasePath()}/compare-manual`;
 
       const response = await axios.post(apiUrl, formData, {
         headers: {
