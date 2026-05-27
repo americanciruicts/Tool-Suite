@@ -18,6 +18,8 @@
     "autoprefixer": "^10.4.16",
     "axios": "^1.6.2",
     "clsx": "^2.0.0",
+    "exceljs": "^4.3.0",
+    "jspdf": "^4.2.1",
     "lucide-react": "^0.294.0",
     "next": "14.2.32",
     "postcss": "^8.4.32",
@@ -26,9 +28,7 @@
     "react-dropzone": "^14.3.8",
     "tailwind-merge": "^2.0.0",
     "tailwindcss": "^3.3.6",
-    "typescript": "^5.3.3",
-    
-    "exceljs": "^4.3.0"
+    "typescript": "^5.3.3"
   },
   "devDependencies": {
     "@typescript-eslint/eslint-plugin": "^6.14.0",
