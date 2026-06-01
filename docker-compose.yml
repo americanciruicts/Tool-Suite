@@ -15,8 +15,10 @@ services:
       # CPU-only. Tunables: BOM_VISION_MODEL/DPI/MAX_TILES/MAX_PAGES.
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
       - BOM_VISION_MODEL=${BOM_VISION_MODEL:-minicpm-v}
-      - BOM_VISION_MAX_TILES=${BOM_VISION_MAX_TILES:-6}
-      - BOM_VISION_MAX_PAGES=${BOM_VISION_MAX_PAGES:-2}
+      # CPU-only host → keep the vision pass small so conversions finish faster.
+      - BOM_VISION_MAX_TILES=${BOM_VISION_MAX_TILES:-4}
+      - BOM_VISION_MAX_PAGES=${BOM_VISION_MAX_PAGES:-1}
+      - BOM_VISION_DPI=${BOM_VISION_DPI:-170}
     depends_on:
       - ollama
     restart: unless-stopped

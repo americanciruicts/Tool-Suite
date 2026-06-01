@@ -188,10 +188,13 @@ def _row_key(row: Dict[str, str]) -> str:
     return "|".join((norm("item"), norm("part_number"), norm("refdes"), norm("description")))
 
 
-def extract_bom_via_vision(pdf_path: str) -> Optional[pd.DataFrame]:
+def extract_bom_via_vision(pdf_path: str, progress_cb=None) -> Optional[pd.DataFrame]:
     """
     Transcribe a PDF's BOM with a local Ollama vision model. Returns a DataFrame
     with the COLUMNS schema, or None if the vision path is unavailable / empty.
+
+    progress_cb(pct, stage) is called as panels are processed so the UI can show
+    a percentage (vision occupies the 25%–92% band of the overall job).
     """
     if not vision_available():
         return None
@@ -200,9 +203,15 @@ def extract_bom_via_vision(pdf_path: str) -> Optional[pd.DataFrame]:
     if not tiles:
         return None
 
+    n = len(tiles)
     seen = set()
     merged: List[Dict[str, str]] = []
-    for png in tiles:
+    for idx, png in enumerate(tiles):
+        if progress_cb:
+            try:
+                progress_cb(25 + int(67 * idx / max(n, 1)), f"AI reading drawing — panel {idx + 1}/{n}")
+            except Exception:
+                pass
         try:
             rows = _extract_rows_from_tile(png)
         except Exception:

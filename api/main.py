@@ -564,7 +564,8 @@ async def compare_files(
             detail=f"Comparison failed: {str(e)}"
         )
 
-def _do_pdf_conversion(content: bytes, filename: str, mode: str, out_format: str) -> Dict:
+def _do_pdf_conversion(content: bytes, filename: str, mode: str, out_format: str,
+                       progress_cb=None) -> Dict:
     """Blocking PDF→file conversion (runs in a threadpool). Writes temp files,
     extracts, builds the preview payload, and cleans up. Raises on failure."""
     with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_pdf:
@@ -577,7 +578,7 @@ def _do_pdf_conversion(content: bytes, filename: str, mode: str, out_format: str
     output_filename = f"{base}.{ext}"
     output_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_{output_filename}")
     try:
-        result = extract_bom_from_pdf(pdf_path, output_path, mode, out_format)
+        result = extract_bom_from_pdf(pdf_path, output_path, mode, out_format, progress_cb=progress_cb)
         return _build_convert_payload(output_path, output_filename, out_format, result)
     finally:
         for p in (pdf_path, output_path):
@@ -591,8 +592,17 @@ def _do_pdf_conversion(content: bytes, filename: str, mode: str, out_format: str
 async def _run_pdf_job(job_id: str, content: bytes, filename: str,
                        mode: str, out_format: str, cache_key: str):
     """Background task: run the conversion, store the result/error under job_id."""
+    def progress(pct: int, stage: str):
+        job = _JOBS.get(job_id)
+        if job and job.get("status") == "processing":
+            job["progress"] = max(0, min(100, int(pct)))
+            job["stage"] = stage
+            job["ts"] = time.time()
+
     try:
-        payload = await run_in_threadpool(_do_pdf_conversion, content, filename, mode, out_format)
+        payload = await run_in_threadpool(
+            _do_pdf_conversion, content, filename, mode, out_format, progress
+        )
         _cache_put(cache_key, payload)
         _JOBS[job_id] = {"status": "done", "payload": payload, "ts": time.time()}
         logger.info(f"PDF job {job_id} done: {filename} ({mode}/{out_format})")
@@ -643,7 +653,7 @@ async def pdf_to_excel(
 
     _prune_jobs()
     job_id = uuid.uuid4().hex
-    _JOBS[job_id] = {"status": "processing", "ts": time.time()}
+    _JOBS[job_id] = {"status": "processing", "progress": 0, "stage": "Queued", "ts": time.time()}
     logger.info(f"Queued PDF job {job_id}: {file.filename} (mode={mode}, format={out_format})")
     asyncio.create_task(_run_pdf_job(job_id, content, file.filename, mode, out_format, cache_key))
     return JSONResponse(content={"status": "processing", "job_id": job_id}, status_code=202)
@@ -657,7 +667,11 @@ async def pdf_to_excel_status(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Unknown or expired job id")
     if job["status"] == "processing":
-        return JSONResponse(content={"status": "processing"})
+        return JSONResponse(content={
+            "status": "processing",
+            "progress": job.get("progress", 0),
+            "stage": job.get("stage", "Working…"),
+        })
     if job["status"] == "error":
         return JSONResponse(content={"status": "error", "detail": job.get("detail", "conversion failed")})
     return JSONResponse(content={"status": "done", **job["payload"]})

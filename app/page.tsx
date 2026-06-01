@@ -536,6 +536,8 @@ export default function Home() {
   // 'normal' = generic any-PDF table extraction. And the output file format.
   const [pdfMode, setPdfMode] = useState<'bom' | 'normal'>('bom');
   const [pdfFormat, setPdfFormat] = useState<'excel' | 'word'>('excel');
+  const [pdfProgress, setPdfProgress] = useState(0);
+  const [pdfStage, setPdfStage] = useState('');
 
   // Image (JPG/PNG) → Excel conversion states
   const [imageFile, setImageFile] = useState<File | null>(null);
@@ -697,6 +699,8 @@ export default function Home() {
     setPdfProcessing(true);
     setPdfError(null);
     setPdfPreview(null);
+    setPdfProgress(0);
+    setPdfStage('Uploading…');
     try {
       const formData = new FormData();
       formData.append('file', pdfFile);
@@ -726,13 +730,15 @@ export default function Home() {
       // Poll up to ~20 minutes (large drawings via AI vision are slow).
       const statusUrl = `${apiUrl}/status/${jobId}`;
       const deadline = Date.now() + 20 * 60 * 1000;
+      setPdfStage('Starting…');
       while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 2500));
+        await new Promise((r) => setTimeout(r, 2000));
         const s = await axios.get<any>(statusUrl, { headers });
         const st = s.data?.status;
-        if (st === 'done') { finish(s.data as ConvertPreview); return; }
+        if (st === 'done') { setPdfProgress(100); finish(s.data as ConvertPreview); return; }
         if (st === 'error') { throw new Error(s.data?.detail || 'Conversion failed.'); }
-        // else 'processing' — keep polling
+        if (typeof s.data?.progress === 'number') setPdfProgress(s.data.progress);
+        if (s.data?.stage) setPdfStage(s.data.stage);
       }
       throw new Error('Conversion timed out. Try Normal mode or a smaller PDF.');
     } catch (err: any) {
@@ -2066,9 +2072,23 @@ export default function Home() {
                 </button>
               </div>
 
-              {pdfProcessing && pdfMode === 'bom' && (
-                <div className="mx-4 mb-4 p-3 bg-blue-50 border border-blue-200 rounded-lg text-sm text-blue-700">
-                  Working… BOM extraction can take a few minutes for large engineering drawings (AI vision runs locally). You can leave this tab open.
+              {pdfProcessing && (
+                <div className="mx-4 mb-4 p-4 bg-blue-50 border border-blue-200 rounded-lg">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-sm font-medium text-blue-800">{pdfStage || 'Working…'}</span>
+                    <span className="text-sm font-mono tabular-nums text-blue-700">{pdfProgress}%</span>
+                  </div>
+                  <div className="w-full h-2.5 bg-blue-100 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-blue-600 rounded-full transition-all duration-500 ease-out"
+                      style={{ width: `${Math.max(3, pdfProgress)}%` }}
+                    />
+                  </div>
+                  {pdfMode === 'bom' && (
+                    <p className="mt-2 text-xs text-blue-600">
+                      Large engineering drawings use local AI vision and can take a few minutes — you can leave this tab open.
+                    </p>
+                  )}
                 </div>
               )}
 

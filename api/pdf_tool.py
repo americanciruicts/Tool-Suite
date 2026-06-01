@@ -1508,7 +1508,8 @@ def _extract_generic_tables_from_pdf(pdf_path: str) -> Optional[Dict]:
 
 
 def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
-                         mode: str = "bom", out_format: str = "excel") -> Dict:
+                         mode: str = "bom", out_format: str = "excel",
+                         progress_cb=None) -> Dict:
     """
     Main entry point: extract a table from a PDF and write the output file.
 
@@ -1528,10 +1529,19 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
     mode = (mode or "bom").lower()
     out_format = (out_format or "excel").lower()
 
+    def _p(pct, stage):
+        if progress_cb:
+            try:
+                progress_cb(pct, stage)
+            except Exception:
+                pass
+
     # Step 1: Validate digital PDF
+    _p(5, "Reading PDF")
     validate_digital_pdf(pdf_path)
 
     # Step 2: Detect BOM table (with generic fallback)
+    _p(12, "Detecting tables")
     try:
         table_data = detect_bom_table(pdf_path)
     except ValueError as e:
@@ -1577,6 +1587,7 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
             except Exception:
                 return None
 
+        _p(20, "Mapping BOM columns")
         bom_df = _safe_map(df)
 
         # Hybrid accuracy: the text path often *looks* like it found a table on a
@@ -1590,7 +1601,8 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
             try:
                 from vision_tool import extract_bom_via_vision, vision_available
                 if vision_available():
-                    vision_df = extract_bom_via_vision(pdf_path)
+                    _p(25, "AI vision: rendering drawing")
+                    vision_df = extract_bom_via_vision(pdf_path, progress_cb=progress_cb)
                     if vision_df is not None and not vision_df.empty:
                         vision_bom = _safe_map(vision_df)
                         if vision_bom is not None and len(vision_bom) > text_bom_rows:
@@ -1610,6 +1622,7 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
             warnings.append("BOM normalization produced no rows; BOM tab mirrors the raw table.")
 
         preview_df = bom_df if (bom_df is not None and not bom_df.empty) else raw_df
+        _p(94, "Writing file")
         if out_format == "word":
             generate_word_document(
                 [("BOM", bom_df), ("Normal (raw extraction)", raw_df)], output_excel_path)
@@ -1620,12 +1633,14 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
     else:
         # Normal: any PDF → raw table, single sheet/table, no BOM normalization.
         preview_df = raw_df
+        _p(60, "Writing file")
         if out_format == "word":
             generate_word_document([("PDF", raw_df)], output_excel_path)
             sheets = ["PDF"]
         else:
             generate_single_sheet_workbook(raw_df, output_excel_path, sheet_name="PDF")
             sheets = ["PDF"]
+    _p(99, "Finalizing")
 
     # Per-column confidence — content-pattern score per detected type. Lets
     # the UI flag specific weak columns ("Qty: 60% — review qty mapping")
