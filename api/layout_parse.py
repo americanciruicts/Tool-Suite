@@ -31,6 +31,19 @@ _CAGE = re.compile(r"^[0-9A-Z]{4,5}$")
 _REFDES_LINE = re.compile(
     r"^[A-Z]{1,4}\d+[A-Z]?(?:[-,]\d+)*(?:[,\s]+[A-Z]{0,4}\d+[A-Z]?(?:[-,]\d+)*)*[,]?$"
 )
+# Component-category words that sit between description and manufacturer in the
+# layout — they must not be mistaken for the manufacturer.
+_CATEGORIES = {
+    "RESISTOR", "CAPACITOR", "IC", "DIODE", "LED", "TRANSISTOR", "MOSFET",
+    "CONNECTOR", "INDUCTOR", "CRYSTAL", "OSCILLATOR", "SWITCH", "FUSE", "RELAY",
+    "FERRITE", "PWB", "PCB", "HARDWARE", "LABEL", "SOCKET", "TRANSCEIVER",
+    "REGULATOR", "SENSOR", "FILTER", "JUMPER", "HEADER", "MEMORY",
+}
+
+
+def _looks_like_partno(tok: str) -> bool:
+    """A real part number is a single token (no spaces/commas) of decent length."""
+    return bool(tok) and " " not in tok and "," not in tok and len(tok) >= 3
 
 
 def _layout_text(pdf_path: str, max_pages: int) -> str:
@@ -70,21 +83,42 @@ def parse_bom_from_layout(pdf_path: str, max_pages: int = 6) -> Optional[pd.Data
                 pending_refdes = s.rstrip(",")
             continue
 
-        item, qty, cage, partno = toks[c - 2], toks[c - 1], toks[c], toks[c + 1]
-        if len(partno) < 3:
-            continue
+        item, qty, cage = toks[c - 2], toks[c - 1], toks[c]
+        partno = toks[c + 1]
+        rem = toks[c + 2:]
 
+        # If the "part number" token has spaces/commas, the part-number column
+        # was blank and this is really the description shifted left by one.
+        if not _looks_like_partno(partno):
+            rem = [partno] + rem
+            partno = ""
+
+        # Reference designators: tokens before item#, minus a stray drawing-zone
+        # letter (e.g. "E D4,D49" → "D4,D49").
         if c - 2 >= 1:
             refdes = " ".join(toks[: c - 2]).rstrip(",")
+            refdes = re.sub(r"^[A-Z]\s+", "", refdes)
         else:
             refdes = pending_refdes
         pending_refdes = ""
 
-        rem = toks[c + 2:]
         if rem and rem[0].isdigit() and len(rem[0]) <= 2:  # drop SMT/layer code
             rem = rem[1:]
         desc = rem[0] if rem else ""
-        mfr = rem[-1] if len(rem) >= 2 else ""
+        # Manufacturer = last token that isn't a category word (maker names are
+        # often truncated by the column width, but better than a category).
+        mfr = ""
+        for tok in reversed(rem[1:]):
+            if tok.upper() in _CATEGORIES:
+                continue
+            if tok.isdigit() and len(tok) <= 2:   # trailing SMT/layer digit
+                continue
+            mfr = tok
+            break
+
+        # Keep the row if it has a part number or a description.
+        if not (partno or desc):
+            continue
 
         rows.append({
             "Item No.": item,

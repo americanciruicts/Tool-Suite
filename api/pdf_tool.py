@@ -1653,20 +1653,46 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
     _p(5, "Reading PDF")
     validate_digital_pdf(pdf_path)
 
-    # Step 2: Detect BOM table (with generic fallback)
-    _p(12, "Detecting tables")
-    try:
-        table_data = detect_bom_table(pdf_path)
-    except ValueError as e:
-        fallback = _extract_generic_tables_from_pdf(pdf_path)
-        if fallback is None:
-            raise ValueError(
-                "No table detected in this PDF. Ensure the PDF contains a table with "
-                "a header row and at least one data row."
-            ) from e
-        warnings.append(f"BOM detection skipped: {e}. Exporting raw table.")
-        table_data = fallback
-        is_bom_like = False
+    # Step 2: Detect the BOM table.
+    table_data = None
+    early_layout = False
+
+    # Fast path (bom mode): try the deterministic columnar parser first. On
+    # engineering drawings this returns the parts list in <1s and lets us skip
+    # the slow geometry scan. It returns None for non-columnar BOMs, which then
+    # fall through to the normal detection below.
+    if mode == "bom":
+        try:
+            from layout_parse import parse_bom_from_layout
+            _p(12, "Parsing parts-list columns")
+            cand = parse_bom_from_layout(pdf_path)
+            if cand is not None and len(cand) >= 5:
+                table_data = {
+                    'table_data': cand,
+                    'header_row': list(cand.columns),
+                    'confidence': 0.9,
+                    'page_numbers': [1],
+                    'extraction_method': 'layout-columns',
+                }
+                early_layout = True
+                warnings.append("Parsed the drawing's parts-list columns directly.")
+        except Exception:
+            table_data = None
+
+    if table_data is None:
+        _p(15, "Detecting tables")
+        try:
+            table_data = detect_bom_table(pdf_path)
+        except ValueError as e:
+            fallback = _extract_generic_tables_from_pdf(pdf_path)
+            if fallback is None:
+                raise ValueError(
+                    "No table detected in this PDF. Ensure the PDF contains a table with "
+                    "a header row and at least one data row."
+                ) from e
+            warnings.append(f"BOM detection skipped: {e}. Exporting raw table.")
+            table_data = fallback
+            is_bom_like = False
 
     if table_data['confidence'] < 0.6:
         warnings.append(f"Table detected with low confidence ({table_data['confidence']:.0%}). Results may require manual review.")
@@ -1674,7 +1700,7 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
     # Keep the source's own columns and order — no BOM schema expansion.
     df = table_data['table_data']
 
-    if is_bom_like:
+    if is_bom_like and not early_layout:
         df = split_merged_cells(df)
         df = remove_duplicate_headers(df, table_data['header_row'])
         df = align_and_clean(df)
