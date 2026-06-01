@@ -565,7 +565,7 @@ async def compare_files(
         )
 
 def _do_pdf_conversion(content: bytes, filename: str, mode: str, out_format: str,
-                       progress_cb=None) -> Dict:
+                       progress_cb=None, text_model: Optional[str] = None) -> Dict:
     """Blocking PDF→file conversion (runs in a threadpool). Writes temp files,
     extracts, builds the preview payload, and cleans up. Raises on failure."""
     with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_pdf:
@@ -578,7 +578,8 @@ def _do_pdf_conversion(content: bytes, filename: str, mode: str, out_format: str
     output_filename = f"{base}.{ext}"
     output_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_{output_filename}")
     try:
-        result = extract_bom_from_pdf(pdf_path, output_path, mode, out_format, progress_cb=progress_cb)
+        result = extract_bom_from_pdf(pdf_path, output_path, mode, out_format,
+                                      progress_cb=progress_cb, text_model=text_model)
         return _build_convert_payload(output_path, output_filename, out_format, result)
     finally:
         for p in (pdf_path, output_path):
@@ -590,7 +591,7 @@ def _do_pdf_conversion(content: bytes, filename: str, mode: str, out_format: str
 
 
 async def _run_pdf_job(job_id: str, content: bytes, filename: str,
-                       mode: str, out_format: str, cache_key: str):
+                       mode: str, out_format: str, cache_key: str, text_model: str = None):
     """Background task: run the conversion, store the result/error under job_id."""
     def progress(pct: int, stage: str):
         job = _JOBS.get(job_id)
@@ -601,7 +602,7 @@ async def _run_pdf_job(job_id: str, content: bytes, filename: str,
 
     try:
         payload = await run_in_threadpool(
-            _do_pdf_conversion, content, filename, mode, out_format, progress
+            _do_pdf_conversion, content, filename, mode, out_format, progress, text_model
         )
         _cache_put(cache_key, payload)
         _JOBS[job_id] = {"status": "done", "payload": payload, "ts": time.time()}
@@ -621,6 +622,7 @@ async def pdf_to_excel(
     file: UploadFile = File(...),
     mode: str = Form("bom"),
     output_format: str = Form("excel"),
+    quality: str = Form("accuracy"),
 ):
     """
     Convert a PDF to Excel/Word — asynchronous.
@@ -644,18 +646,23 @@ async def pdf_to_excel(
     out_format = (output_format or "excel").lower()
     if out_format not in ("excel", "word"):
         out_format = "excel"
+    quality = (quality or "accuracy").lower()
+    if quality not in ("accuracy", "speed"):
+        quality = "accuracy"
+    from text_extract_llm import model_for_quality
+    text_model = model_for_quality(quality)
 
-    cache_key = f"pdf:{mode}:{out_format}:{_sha256_of(content)}"
+    cache_key = f"pdf:{mode}:{out_format}:{quality}:{_sha256_of(content)}"
     cached = _cache_get(cache_key)
     if cached:
-        logger.info(f"Cache hit for PDF {file.filename} ({mode}/{out_format})")
+        logger.info(f"Cache hit for PDF {file.filename} ({mode}/{out_format}/{quality})")
         return JSONResponse(content={"status": "done", **cached})
 
     _prune_jobs()
     job_id = uuid.uuid4().hex
     _JOBS[job_id] = {"status": "processing", "progress": 0, "stage": "Queued", "ts": time.time()}
-    logger.info(f"Queued PDF job {job_id}: {file.filename} (mode={mode}, format={out_format})")
-    asyncio.create_task(_run_pdf_job(job_id, content, file.filename, mode, out_format, cache_key))
+    logger.info(f"Queued PDF job {job_id}: {file.filename} (mode={mode}, format={out_format}, quality={quality}, model={text_model})")
+    asyncio.create_task(_run_pdf_job(job_id, content, file.filename, mode, out_format, cache_key, text_model))
     return JSONResponse(content={"status": "processing", "job_id": job_id}, status_code=202)
 
 

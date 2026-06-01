@@ -1622,7 +1622,7 @@ def _extract_generic_tables_from_pdf(pdf_path: str) -> Optional[Dict]:
 
 def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
                          mode: str = "bom", out_format: str = "excel",
-                         progress_cb=None) -> Dict:
+                         progress_cb=None, text_model: Optional[str] = None) -> Dict:
     """
     Main entry point: extract a table from a PDF and write the output file.
 
@@ -1703,32 +1703,69 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
         _p(20, "Mapping BOM columns")
         bom_df = _safe_map(df)
 
-        # Hybrid accuracy: the text path often *looks* like it found a table on a
-        # dense engineering drawing (it grabs the title block) yet yields no real
-        # BOM rows. The reliable failure signal is "few/zero mapped BOM rows" —
-        # not raw confidence. When that happens, fall back to the local Ollama
-        # vision model, which reads glyphs precisely (5≠S, 0≠O) and reconstructs
-        # the parts list the geometry parser misses. No-op if Ollama/deps absent.
+        # The geometry parser often *looks* like it found a table on a dense
+        # engineering drawing (it grabs the title block) yet yields no real BOM
+        # rows. The reliable failure signal is "few/zero mapped BOM rows".
         text_bom_rows = 0 if bom_df is None else len(bom_df)
         if text_bom_rows < 3 or table_data['confidence'] < 0.6:
+            # 0) Fast deterministic parse of columnar drawing parts lists
+            #    (pdftotext -layout keeps the columns aligned; the CAGE code
+            #    anchors each row). Instant and free — handles MIL-STD/ASME
+            #    "LIST OF MATERIALS" drawings the geometry parser garbles.
             try:
-                from vision_tool import extract_bom_via_vision, vision_available
-                if vision_available():
-                    _p(25, "AI vision: rendering drawing")
-                    vision_df = extract_bom_via_vision(pdf_path, progress_cb=progress_cb)
-                    if vision_df is not None and not vision_df.empty:
-                        vision_bom = _safe_map(vision_df)
-                        if vision_bom is not None and len(vision_bom) > text_bom_rows:
-                            raw_df = vision_df
-                            bom_df = vision_bom
-                            extraction_method = 'ollama-vision'
-                            warnings.append(
-                                "Used local AI vision (Ollama) — text extraction found no usable BOM rows."
-                            )
-                else:
-                    warnings.append("AI vision fallback unavailable (Ollama not reachable); used text extraction.")
+                from layout_parse import parse_bom_from_layout
+                _p(25, "Parsing parts-list columns")
+                lay_df = parse_bom_from_layout(pdf_path)
+                if lay_df is not None and not lay_df.empty:
+                    lay_bom = _safe_map(lay_df)
+                    if lay_bom is not None and len(lay_bom) > text_bom_rows:
+                        raw_df = lay_df
+                        bom_df = lay_bom
+                        text_bom_rows = len(lay_bom)
+                        extraction_method = 'layout-columns'
+                        warnings.append("Parsed the drawing's parts-list columns directly.")
             except Exception as e:
-                warnings.append(f"AI vision fallback error: {e}")
+                warnings.append(f"Layout parse error: {e}")
+
+        if (text_bom_rows < 3 or table_data['confidence'] < 0.6) and \
+                os.environ.get("BOM_TEXT_LLM_ENABLED", "false").lower() in ("1", "true", "yes"):
+            # 1) Slower opt-in fallback: hand the PDF text layer to a local text
+            #    LLM. Off by default — slow on CPU and the deterministic layout
+            #    parser already handles the common columnar drawings.
+            try:
+                from text_extract_llm import extract_bom_via_text_llm, text_llm_available
+                if text_llm_available():
+                    _p(30, "AI structuring BOM from text")
+                    llm_df = extract_bom_via_text_llm(pdf_path, progress_cb=progress_cb, model=text_model)
+                    if llm_df is not None and not llm_df.empty:
+                        llm_bom = _safe_map(llm_df)
+                        if llm_bom is not None and len(llm_bom) > text_bom_rows:
+                            raw_df = llm_df
+                            bom_df = llm_bom
+                            text_bom_rows = len(llm_bom)
+                            extraction_method = 'ollama-text-llm'
+                            warnings.append("Used local AI text model to structure the parts list.")
+            except Exception as e:
+                warnings.append(f"AI text-structuring error: {e}")
+
+            # 2) Optional slow fallback: image vision. Off by default because on
+            #    a CPU host it's slow and tiling can miss the parts-list region.
+            #    Enable with BOM_VISION_ENABLED=true.
+            if text_bom_rows < 3 and os.environ.get("BOM_VISION_ENABLED", "false").lower() in ("1", "true", "yes"):
+                try:
+                    from vision_tool import extract_bom_via_vision, vision_available
+                    if vision_available():
+                        _p(40, "AI vision: rendering drawing")
+                        vision_df = extract_bom_via_vision(pdf_path, progress_cb=progress_cb)
+                        if vision_df is not None and not vision_df.empty:
+                            vision_bom = _safe_map(vision_df)
+                            if vision_bom is not None and len(vision_bom) > text_bom_rows:
+                                raw_df = vision_df
+                                bom_df = vision_bom
+                                extraction_method = 'ollama-vision'
+                                warnings.append("Used local AI vision (Ollama).")
+                except Exception as e:
+                    warnings.append(f"AI vision fallback error: {e}")
 
         if bom_df is None:
             bom_df = raw_df
