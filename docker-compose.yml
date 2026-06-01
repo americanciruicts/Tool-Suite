@@ -14,7 +14,7 @@ services:
       # text extractor is used. Tiles/pages kept modest because the server is
       # CPU-only. Tunables: BOM_VISION_MODEL/DPI/MAX_TILES/MAX_PAGES.
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
-      - BOM_VISION_MODEL=${BOM_VISION_MODEL:-minicpm-v}
+      - BOM_VISION_MODEL=${BOM_VISION_MODEL:-qwen2.5vl}
       # CPU-only host → keep the vision pass small so conversions finish faster.
       - BOM_VISION_MAX_TILES=${BOM_VISION_MAX_TILES:-4}
       - BOM_VISION_MAX_PAGES=${BOM_VISION_MAX_PAGES:-1}
