@@ -1663,9 +1663,9 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
     # fall through to the normal detection below.
     if mode == "bom":
         try:
-            from layout_parse import parse_bom_from_layout
+            from layout_parse import parse_bom
             _p(12, "Parsing parts-list columns")
-            cand = parse_bom_from_layout(pdf_path)
+            cand = parse_bom(pdf_path)
             if cand is not None and len(cand) >= 5:
                 table_data = {
                     'table_data': cand,
@@ -1739,9 +1739,9 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
             #    anchors each row). Instant and free — handles MIL-STD/ASME
             #    "LIST OF MATERIALS" drawings the geometry parser garbles.
             try:
-                from layout_parse import parse_bom_from_layout
+                from layout_parse import parse_bom
                 _p(25, "Parsing parts-list columns")
-                lay_df = parse_bom_from_layout(pdf_path)
+                lay_df = parse_bom(pdf_path)
                 if lay_df is not None and not lay_df.empty:
                     lay_bom = _safe_map(lay_df)
                     if lay_bom is not None and len(lay_bom) > text_bom_rows:

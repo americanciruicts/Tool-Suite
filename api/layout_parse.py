@@ -46,6 +46,160 @@ def _looks_like_partno(tok: str) -> bool:
     return bool(tok) and " " not in tok and "," not in tok and len(tok) >= 3
 
 
+# Header/title words that must never be mistaken for data.
+_STOP = {
+    "REFERENCE", "DESIGNATION", "ITEM", "QTY", "CODE", "IDENT", "PART", "OR",
+    "NOMENCLATURE", "IDENTIFYING", "NO.", "DESCRIPTION", "MANUFACTURER",
+    "SPECIFICATION/", "MATERIAL", "LIST", "OF", "MATERIALS", "PARTS",
+    "REVISIONS", "ZONE", "LTR", "APPROVED", "REV", "DATE(YR-MO-", "DATE(YEAR-MO-DA)",
+    "NO", "DWG", "SEE", "SHEET", "NOTE", "NOTES", "CONT", "CONT.", "USED", "ON",
+}
+_DESG = re.compile(r"^[A-Z]{1,4}\d")
+
+
+def _detect_tables(words):
+    """Find parts-list table headers and return each table's column x positions.
+    Handles the two side-by-side sub-tables on MIL-STD/ASME drawings."""
+    from collections import defaultdict
+    rowsby = defaultdict(list)
+    for w in words:
+        if w["text"].upper() in ("DESIGNATION", "NO.", "REQD", "IDENT",
+                                  "IDENTIFYING", "DESCRIPTION", "MANUFACTURER"):
+            rowsby[round(w["top"] / 8)].append(w)
+    tabs = []
+    for grp in rowsby.values():
+        up = {w["text"].upper() for w in grp}
+        if "DESIGNATION" in up and "MANUFACTURER" in up:
+            def gx(name):
+                return [w for w in grp if w["text"].upper() == name][0]["x0"]
+            des, reqd, ident, idno, desc, man = (
+                gx("DESIGNATION"), gx("REQD"), gx("IDENT"),
+                gx("IDENTIFYING"), gx("DESCRIPTION"), gx("MANUFACTURER"))
+            nos = [w["x0"] for w in grp if w["text"].upper() == "NO." and des < w["x0"] < reqd]
+            tabs.append({
+                "refdes": des, "item": nos[0] if nos else (des + reqd) / 2,
+                "qty": reqd, "cage": ident, "partno": idno, "desc": desc, "mfr": man,
+                "top": [w for w in grp if w["text"].upper() == "DESIGNATION"][0]["top"],
+            })
+    return tabs
+
+
+def parse_bom_coords(pdf_path: str, max_pages: int = 8) -> Optional[pd.DataFrame]:
+    """
+    Coordinate-based parser for columnar drawing parts lists. Uses each word's
+    x/y position to assign it to a column and to the nearest item row — which
+    correctly reassembles wide cells that wrap across lines (long reference-
+    designator lists, full manufacturer names). Handles inverted tables (header
+    at the bottom, rows above it).
+    """
+    try:
+        import pdfplumber
+        from collections import defaultdict
+    except Exception:
+        return None
+
+    out: List[Dict[str, str]] = []
+    try:
+        pdf = pdfplumber.open(pdf_path)
+    except Exception:
+        return None
+    with pdf:
+        for page in pdf.pages[:max_pages]:
+            try:
+                words = page.extract_words(keep_blank_chars=False)
+            except Exception:
+                continue
+            if not words:
+                continue
+            for t in _detect_tables(words):
+                cols = ["refdes", "item", "qty", "cage", "partno", "desc", "mfr"]
+                xs = [t[c] for c in cols]
+                edges = [(xs[i] + xs[i + 1]) / 2 for i in range(len(xs) - 1)]
+
+                def colof(w):
+                    cx = (w["x0"] + w["x1"]) / 2
+                    if cx < t["refdes"] - 80:
+                        return None
+                    for i, e in enumerate(edges):
+                        if cx < e:
+                            return cols[i]
+                    return "mfr" if cx < t["mfr"] + 220 else None
+
+                # Data rows are above the header on these inverted tables.
+                body = [w for w in words
+                        if w["top"] < t["top"] - 6 and colof(w) and w["text"].upper() not in _STOP]
+                bytop = defaultdict(list)
+                for w in body:
+                    bytop[round(w["top"] / 6)].append(w)
+
+                anchors = []
+                for line in bytop.values():
+                    items = [w for w in line if w["text"].isdigit() and colof(w) == "item" and len(w["text"]) <= 3]
+                    cages = [w for w in line if _CAGE.match(w["text"]) and colof(w) == "cage"]
+                    if items and cages:
+                        qtys = [w for w in line if w["text"].isdigit() and colof(w) == "qty"]
+                        pns = [w for w in line if colof(w) == "partno" and w["text"].upper() not in _STOP]
+                        anchors.append({
+                            "item": items[0]["text"], "top": items[0]["top"],
+                            "qty": qtys[0]["text"] if qtys else "",
+                            "cage": cages[0]["text"],
+                            "partno": " ".join(w["text"] for w in sorted(pns, key=lambda w: w["x0"])),
+                        })
+                if not anchors:
+                    continue
+                anchors.sort(key=lambda a: a["top"])
+                atops = [a["top"] for a in anchors]
+                lo = min(atops) - 40
+                cells = [defaultdict(list) for _ in anchors]
+                for w in body:
+                    if not (lo <= w["top"] <= t["top"]):
+                        continue
+                    col = colof(w)
+                    if col in ("refdes", "desc", "mfr"):
+                        i = min(range(len(atops)), key=lambda k: abs(atops[k] - w["top"]))
+                        cells[i][col].append(w)
+
+                for a, cell in zip(anchors, cells):
+                    def txt(col):
+                        return [w["text"] for w in sorted(cell[col], key=lambda w: (w["top"], w["x0"]))]
+                    refdes = " ".join(x for x in txt("refdes") if _DESG.match(x) or "," in x or "-" in x)
+                    desc = " ".join(txt("desc"))
+                    mfr = " ".join(x for x in txt("mfr")
+                                   if x.upper() not in _CATEGORIES and not x.isdigit()
+                                   and len(x) > 1 and x.upper() not in _STOP)
+                    if a["partno"] or desc:
+                        out.append({
+                            "Item No.": a["item"], "Reference Designation": refdes,
+                            "Qty": a["qty"], "CAGE/Code Ident": a["cage"],
+                            "Part Number": a["partno"], "Description": desc, "Manufacturer": mfr,
+                        })
+
+    if len(out) < 2:
+        return None
+    seen = set()
+    rows = []
+    for r in out:
+        key = (r["Item No."], r["Part Number"])
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(r)
+    rows.sort(key=lambda r: int(r["Item No."]) if str(r["Item No."]).isdigit() else 9999)
+    return pd.DataFrame(rows, columns=COLUMNS)
+
+
+def parse_bom(pdf_path: str, max_pages: int = 8) -> Optional[pd.DataFrame]:
+    """Best columnar BOM parse: coordinate-based first (reassembles wrapped
+    cells / full manufacturer names), then the text-layout parser as fallback."""
+    try:
+        df = parse_bom_coords(pdf_path, max_pages)
+        if df is not None and len(df) >= 2:
+            return df
+    except Exception:
+        pass
+    return parse_bom_from_layout(pdf_path, max_pages)
+
+
 def _layout_text(pdf_path: str, max_pages: int) -> str:
     return subprocess.run(
         ["pdftotext", "-layout", "-f", "1", "-l", str(max_pages), pdf_path, "-"],
