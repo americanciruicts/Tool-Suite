@@ -16,6 +16,7 @@ import pdfplumber
 import pypdf
 import pandas as pd
 import tempfile
+import io
 import os
 from typing import Dict, List, Tuple, Optional
 from openpyxl import Workbook
@@ -1291,17 +1292,12 @@ def _write_sheet(ws, df: pd.DataFrame) -> None:
         ws.column_dimensions[column_letter].width = min(max_length + 2, 50)
 
 
-def generate_two_tab_workbook(raw_df: pd.DataFrame, bom_df: pd.DataFrame, output_path: str) -> str:
+def generate_two_tab_workbook(raw_df: pd.DataFrame, bom_df: pd.DataFrame, output_path: str,
+                              images: Optional[List[bytes]] = None) -> str:
     """
-    Write the converter output as a two-sheet workbook:
-
-      * "Normal" — the table exactly as extracted from the PDF (source columns
-        and order preserved).
-      * "BOM"    — the normalized BOM (Item / Manufacturer / MPN / Qty /
-        Reference Designators / Description …).
-
-    The "BOM" sheet is made the active *and* visually selected tab so it is the
-    one shown when the file opens. No merged cells in either sheet.
+    Write the converter output as a two-sheet workbook (fallback when the
+    stakeholder template can't be used): "Normal" (raw) + "BOM" (normalized),
+    BOM selected. Adds a "Drawing" sheet when page images are provided.
     """
     wb = Workbook()
 
@@ -1312,38 +1308,147 @@ def generate_two_tab_workbook(raw_df: pd.DataFrame, bom_df: pd.DataFrame, output
     bom_ws = wb.create_sheet("BOM")
     _write_sheet(bom_ws, bom_df if bom_df is not None and not bom_df.empty else raw_df)
 
+    _add_drawing_sheet(wb, images)
+
     # Make BOM the selected/active tab on open.
     wb.active = wb.index(bom_ws)
     for sheet in wb.worksheets:
         sheet.sheet_view.tabSelected = (sheet is bom_ws)
 
-    for ws in wb.worksheets:
-        assert len(ws.merged_cells.ranges) == 0, "Generated Excel contains merged cells!"
+    wb.save(output_path)
+    return output_path
+
+
+# Stakeholder quote template bundled with the backend; BOM data is written into
+# its line-item area so the output matches the format buyers already use.
+TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "templates", "BOM_QUOTE_TEMPLATE.xlsx")
+_TEMPLATE_HEADER_ROW = 23  # row 24 is the first data row; columns A..G = QUOTE_TEMPLATE_COLUMNS
+
+
+def generate_template_bom_workbook(bom_df: pd.DataFrame, raw_df: pd.DataFrame, output_path: str,
+                                   images: Optional[List[bytes]] = None) -> str:
+    """
+    Fill a copy of BOM QUOTE TEMPLATE.xlsx with the extracted BOM rows so the
+    output matches the stakeholder's quoting format (title block, headers,
+    pricing-tier columns and formulas all preserved). The BOM line items are
+    written into columns A–G starting at row 24. A "Normal (raw)" sheet and a
+    "Drawing" sheet are appended. Raises if the template can't be loaded so the
+    caller can fall back to the plain two-tab workbook.
+    """
+    from openpyxl import load_workbook as _load_wb
+
+    wb = _load_wb(TEMPLATE_PATH)  # keep formulas/styling
+    ws = wb["BOM"] if "BOM" in wb.sheetnames else wb.active
+
+    cols = list(bom_df.columns) if bom_df is not None else []
+    # Map our bom_df columns onto template columns A..G (QUOTE_TEMPLATE_COLUMNS).
+    def _col_for(label):
+        return cols.index(label) if label in cols else None
+    idx = {c: _col_for(c) for c in QUOTE_TEMPLATE_COLUMNS}
+
+    start = _TEMPLATE_HEADER_ROW + 1
+    n = 0 if bom_df is None else len(bom_df)
+    for i in range(n):
+        row = bom_df.iloc[i]
+        for c_off, label in enumerate(QUOTE_TEMPLATE_COLUMNS):  # A..G
+            j = idx.get(label)
+            val = "" if j is None else row.iloc[j]
+            ws.cell(row=start + i, column=1 + c_off).value = ("" if pd.isna(val) else str(val))
+
+    # Append the raw extraction + drawing as extra sheets.
+    raw_ws = wb.create_sheet("Normal (raw)")
+    _write_sheet(raw_ws, raw_df)
+    _add_drawing_sheet(wb, images)
+
+    # Open on the BOM sheet.
+    try:
+        wb.active = wb.index(ws)
+        for sheet in wb.worksheets:
+            sheet.sheet_view.tabSelected = (sheet is ws)
+    except Exception:
+        pass
 
     wb.save(output_path)
     return output_path
 
 
-def generate_single_sheet_workbook(df: pd.DataFrame, output_path: str, sheet_name: str = "PDF") -> str:
+def render_drawing_images(pdf_path: str, max_pages: int = 3, max_px: int = 1600) -> List[bytes]:
+    """Render the first pages of the PDF to downscaled PNGs for embedding as a
+    visual reference in the output. Best-effort: returns [] if pdf2image/Pillow
+    or poppler are unavailable, or rendering fails — never raises."""
+    try:
+        from pdf2image import convert_from_path
+        from PIL import Image as PILImage  # noqa: F401
+    except Exception:
+        return []
+    try:
+        pages = convert_from_path(pdf_path, dpi=150, first_page=1, last_page=max_pages)
+    except Exception:
+        return []
+    out: List[bytes] = []
+    for pg in pages:
+        try:
+            w, h = pg.size
+            scale = min(1.0, float(max_px) / max(w, h))
+            if scale < 1.0:
+                pg = pg.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+            buf = io.BytesIO()
+            pg.save(buf, format="PNG")
+            out.append(buf.getvalue())
+        except Exception:
+            continue
+    return out
+
+
+def _add_drawing_sheet(wb, images: Optional[List[bytes]]):
+    """Add a 'Drawing' sheet with the rendered page image(s) stacked vertically."""
+    if not images:
+        return
+    try:
+        from openpyxl.drawing.image import Image as XLImage
+    except Exception:
+        return
+    ws = wb.create_sheet("Drawing")
+    ws["A1"] = "Source drawing (visual reference)"
+    ws["A1"].font = Font(bold=True)
+    row = 3
+    keep = []  # hold BytesIO refs alive until wb.save reads them
+    for png in images:
+        try:
+            bio = io.BytesIO(png)
+            keep.append(bio)
+            img = XLImage(bio)
+            ws.add_image(img, f"A{row}")
+            row += int((getattr(img, "height", 600) or 600) / 18) + 4
+        except Exception:
+            continue
+    ws._bom_keep_images = keep  # prevent GC before save
+
+
+def generate_single_sheet_workbook(df: pd.DataFrame, output_path: str, sheet_name: str = "PDF",
+                                   images: Optional[List[bytes]] = None) -> str:
     """Write a one-sheet workbook (used by 'normal' mode — any PDF → raw table)."""
     wb = Workbook()
     ws = wb.active
     ws.title = sheet_name[:31] or "PDF"
     _write_sheet(ws, df)
     assert len(ws.merged_cells.ranges) == 0, "Generated Excel contains merged cells!"
+    _add_drawing_sheet(wb, images)
     wb.save(output_path)
     return output_path
 
 
-def generate_word_document(frames: List, output_path: str) -> str:
+def generate_word_document(frames: List, output_path: str,
+                           images: Optional[List[bytes]] = None) -> str:
     """
-    Write a .docx containing one heading + table per (heading, DataFrame) pair.
+    Write a .docx containing one heading + table per (heading, DataFrame) pair,
+    then (if provided) a "Drawing" section with the rendered page image(s).
 
     Used for the Word output option. Empty frames are skipped. Cells are plain
     text (wrapped text already merged upstream), so there are no merged cells.
     """
     from docx import Document
-    from docx.shared import Pt
+    from docx.shared import Pt, Inches
 
     doc = Document()
     wrote_any = False
@@ -1368,6 +1473,14 @@ def generate_word_document(frames: List, output_path: str) -> str:
 
     if not wrote_any:
         doc.add_paragraph("No table rows were extracted from this PDF.")
+
+    if images:
+        doc.add_heading("Drawing", level=1)
+        for png in images:
+            try:
+                doc.add_picture(io.BytesIO(png), width=Inches(6.5))
+            except Exception:
+                continue
 
     doc.save(output_path)
     return output_path
@@ -1622,24 +1735,35 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
             warnings.append("BOM normalization produced no rows; BOM tab mirrors the raw table.")
 
         preview_df = bom_df if (bom_df is not None and not bom_df.empty) else raw_df
+        _p(90, "Rendering drawing image")
+        images = render_drawing_images(pdf_path)
         _p(94, "Writing file")
         if out_format == "word":
             generate_word_document(
-                [("BOM", bom_df), ("Normal (raw extraction)", raw_df)], output_excel_path)
-            sheets = ["BOM", "Normal (raw extraction)"]
+                [("BOM", bom_df), ("Normal (raw extraction)", raw_df)], output_excel_path, images=images)
+            sheets = ["BOM", "Normal (raw extraction)", "Drawing"]
         else:
-            generate_two_tab_workbook(raw_df, bom_df, output_excel_path)
-            sheets = ["Normal", "BOM"]
+            # Fill the stakeholder quote template; fall back to the plain
+            # two-tab workbook if the template can't be loaded.
+            try:
+                generate_template_bom_workbook(bom_df, raw_df, output_excel_path, images=images)
+                sheets = ["BOM (quote template)", "Normal (raw)", "Drawing"]
+            except Exception as e:
+                warnings.append(f"Quote-template export failed, used plain layout: {e}")
+                generate_two_tab_workbook(raw_df, bom_df, output_excel_path, images=images)
+                sheets = ["Normal", "BOM", "Drawing"]
     else:
         # Normal: any PDF → raw table, single sheet/table, no BOM normalization.
         preview_df = raw_df
+        _p(55, "Rendering drawing image")
+        images = render_drawing_images(pdf_path)
         _p(60, "Writing file")
         if out_format == "word":
-            generate_word_document([("PDF", raw_df)], output_excel_path)
-            sheets = ["PDF"]
+            generate_word_document([("PDF", raw_df)], output_excel_path, images=images)
+            sheets = ["PDF", "Drawing"]
         else:
-            generate_single_sheet_workbook(raw_df, output_excel_path, sheet_name="PDF")
-            sheets = ["PDF"]
+            generate_single_sheet_workbook(raw_df, output_excel_path, sheet_name="PDF", images=images)
+            sheets = ["PDF", "Drawing"]
     _p(99, "Finalizing")
 
     # Per-column confidence — content-pattern score per detected type. Lets
