@@ -2,8 +2,51 @@ import pandas as pd
 import re
 import os
 import sys
+from functools import lru_cache
+from typing import Optional, List, Tuple
+
+from ai_helpers import (
+    classify_column,
+    score_column_content,
+    normalize_quantity as _ai_normalize_quantity,
+    normalize_mpn as _ai_normalize_mpn,
+    find_fuzzy_mpn_match,
+    description_similarity,
+)
 
 DEBUG_VERBOSE = os.getenv("DEBUG_VERBOSE", "false").lower() == "true"
+
+
+def _read_excel_cached_key(file_path: str, header) -> tuple:
+    """Cache key: path + mtime + size + header-arg. mtime+size invalidates when
+    the underlying file changes (temp files on each request stay distinct)."""
+    try:
+        st = os.stat(file_path)
+        return (file_path, st.st_mtime_ns, st.st_size, header)
+    except OSError:
+        return (file_path, 0, 0, header)
+
+
+@lru_cache(maxsize=32)
+def _cached_read_excel(cache_key: tuple):
+    file_path, _mtime, _size, header = cache_key
+    ext = os.path.splitext(file_path)[1].lower()
+    engine = "xlrd" if ext == ".xls" else None
+    # Convert back from the sentinel "NONE" we stored to the real `None` that
+    # pandas expects for "no header".
+    header_arg = None if header == "NONE" else header
+    if engine:
+        return pd.read_excel(file_path, header=header_arg, engine=engine)
+    return pd.read_excel(file_path, header=header_arg)
+
+
+def read_excel_cached(file_path: str, header=None):
+    """Thin wrapper around pd.read_excel that caches results in-process so
+    repeated reads of the same file+header within a request are ~free."""
+    # Cache returns a shared DataFrame; callers that mutate should .copy().
+    key_header = "NONE" if header is None else header
+    cache_key = _read_excel_cached_key(file_path, key_header)
+    return _cached_read_excel(cache_key)
 
 def safe_print(text):
     """Safe printing function that handles Unicode characters on Windows."""
@@ -129,13 +172,10 @@ def find_header_row_and_map(file_path):
     """Find the header row and map columns to standard names."""
     safe_print(f"\nFinding headers for: {os.path.basename(file_path)}")
     
-    # Read the file without headers first
+    # Read the file without headers first (cached)
     ext = os.path.splitext(file_path)[1].lower()
-    if ext == '.xls':
-        df_raw = pd.read_excel(file_path, header=None, engine='xlrd')
-    else:
-        df_raw = pd.read_excel(file_path, header=None)
-    
+    df_raw = read_excel_cached(file_path, header=None)
+
     safe_print(f"Raw file shape: {df_raw.shape}")
     
     # Debug: Show first 15 rows to understand the file structure
@@ -193,12 +233,9 @@ def find_header_row_and_map(file_path):
             safe_print("WARNING: No header row found, using row 0")
             header_row = 0 
     
-    # Now read the file with the correct header row
-    if ext == '.xls':
-        df = pd.read_excel(file_path, header=header_row, engine='xlrd')
-    else:
-        df = pd.read_excel(file_path, header=header_row)
-    
+    # Now read the file with the correct header row (cached)
+    df = read_excel_cached(file_path, header=header_row)
+
     safe_print(f"Columns after header detection: {list(df.columns)}")
     
     # Debug: Show all column names with their indices
@@ -351,25 +388,19 @@ def read_bom_with_auto_headers(file_path):
     
     header_row, col_map = find_header_row_and_map(file_path)
     ext = os.path.splitext(file_path)[1].lower()
-    
-    # First, read without headers to get the actual data
-    if ext == '.xls':
-        df_raw = pd.read_excel(file_path, header=None, engine='xlrd')
-    else:
-        df_raw = pd.read_excel(file_path, header=None)
-    
+
+    # First, read without headers to get the actual data (cached)
+    df_raw = read_excel_cached(file_path, header=None)
+
     # Get the MPN column data before pandas converts it
     if 'mpn' in col_map and col_map['mpn'] < len(df_raw.columns):
         mpn_col_idx = col_map['mpn']
         # Get the original MPN values as strings
         original_mpn_values = df_raw.iloc[header_row+1:, mpn_col_idx].astype(str).tolist()
         safe_print(f"Original MPN values (first 5): {original_mpn_values[:5]}")
-    
-    # Now read with headers
-    if ext == '.xls':
-        df = pd.read_excel(file_path, header=header_row, engine='xlrd')
-    else:
-        df = pd.read_excel(file_path, header=header_row)
+
+    # Now read with headers (cached; callers mutate columns so copy)
+    df = read_excel_cached(file_path, header=header_row).copy()
     
     # Convert MPN column to string to preserve original formatting
     if 'mpn' in col_map and col_map['mpn'] < len(df.columns):
@@ -450,10 +481,19 @@ def read_bom_with_auto_headers(file_path):
     
     return df, mapped_cols
 
-def compare_boms(file1, file2):
-    """Compare two BOM files and return differences."""
+def compare_boms(file1, file2, fuzzy_threshold: float = 0.88, ignore_pairs: Optional[List[Tuple[str, str]]] = None):
+    """Compare two BOM files and return differences.
+
+    Args:
+        file1, file2: paths to the two Excel files
+        fuzzy_threshold: 0..1 — minimum similarity for the fuzzy MPN-rename
+            pass to flag a removed+added pair as the same physical part.
+        ignore_pairs: optional list of (mpn_in_file_1, mpn_in_file_2) pairs
+            the user has manually rejected. Those pairs will not be promoted
+            to "MPN renamed" even if their similarity passes the threshold.
+    """
     safe_print("Starting BOM comparison...")
-    
+
     # Read both files
     df1, map1 = read_bom_with_auto_headers(file1)
     df2, map2 = read_bom_with_auto_headers(file2)
@@ -703,9 +743,99 @@ def compare_boms(file1, file2):
     modified_parts = []
     unchanged_parts = []
     unrecognized_parts = []
-    
+
+    # ── Duplicate-MPN warning ─────────────────────────────────────────────
+    # Today the lookup is first-row-wins for duplicate MPNs, silently dropping
+    # subsequent occurrences. Surface those so the user can clean their
+    # source data.
+    duplicate_warnings: list[dict] = []
+    def _dups(df, key_series, file_label):
+        seen: dict = {}
+        for idx, k in key_series.items():
+            if not k or k.startswith('COMMENT_'):
+                continue
+            seen.setdefault(k, []).append(idx)
+        for k, indices in seen.items():
+            if len(indices) > 1:
+                duplicate_warnings.append({
+                    'file': file_label,
+                    'mpn': k,
+                    'occurrences': len(indices),
+                    'lines': [int(i) + 2 for i in indices],
+                })
+    _dups(df1, key1, 'file1')
+    _dups(df2, key2, 'file2')
+
+    # ── Fuzzy MPN pairing pass ────────────────────────────────────────────
+    # Real BOMs often have the SAME physical part appear with slightly
+    # different MPN strings across revisions: a hyphen added/removed, a
+    # trailing suffix added ("BC547" → "BC547BTA"), or a typo. Without this,
+    # those rows show up as one "Removed" + one "New" — confusing the user
+    # who knows it's actually a renamed part. We pair them up here and
+    # surface them as Modified rows with both MPNs filled in, plus an
+    # explicit MPN_Changed flag so callers can render them differently.
+    only_in_1 = set1 - set2
+    only_in_2 = set2 - set1
+    fuzzy_pairs: list[tuple[str, str]] = []  # (key_in_1, key_in_2)
+    # Build a set of user-rejected pairs (canonical form on both sides) so
+    # we can skip them in the fuzzy pass.
+    rejected_pairs = set()
+    if ignore_pairs:
+        for a, b in ignore_pairs:
+            rejected_pairs.add((_ai_normalize_mpn(a), _ai_normalize_mpn(b)))
+
+    if only_in_1 and only_in_2:
+        # Skip COMMENT_-prefixed keys (those aren't real MPNs)
+        candidates_1 = [k for k in only_in_1 if not k.startswith('COMMENT_')]
+        candidates_2 = [k for k in only_in_2 if not k.startswith('COMMENT_')]
+        used_2: set = set()
+        for k1 in candidates_1:
+            remaining = [k for k in candidates_2 if k not in used_2]
+            if not remaining:
+                break
+            # Use canonical form (strip punctuation) for similarity
+            canon1 = _ai_normalize_mpn(k1)
+            canon_remaining = {_ai_normalize_mpn(k): k for k in remaining}
+            match = find_fuzzy_mpn_match(canon1, list(canon_remaining.keys()), threshold=fuzzy_threshold)
+            if match is None:
+                continue
+            matched_canon, _score = match
+            # Respect user rejection list
+            if (canon1, matched_canon) in rejected_pairs:
+                continue
+            k2 = canon_remaining[matched_canon]
+            fuzzy_pairs.append((k1, k2))
+            used_2.add(k2)
+
+    # Apply pairs: remove from the only-in-X sets, append to modified_parts
+    paired_in_1 = {p[0] for p in fuzzy_pairs}
+    paired_in_2 = {p[1] for p in fuzzy_pairs}
+
+    for k1, k2 in fuzzy_pairs:
+        idx1 = row1_by_key.get(k1)
+        idx2 = row2_by_key.get(k2)
+        if idx1 is None or idx2 is None:
+            continue
+        modified_parts.append({
+            'MPN': _get_mpn_by_index(df1, idx1, map1),
+            'File1 MPN': _get_mpn_by_index(df1, idx1, map1),
+            'File2 MPN': _get_mpn_by_index(df2, idx2, map2),
+            'Ref Des/LOC': _get_value_by_index(df1, idx1, map1, 'refdes'),
+            'File1 Ref Des': _get_value_by_index(df1, idx1, map1, 'refdes'),
+            'File2 Ref Des': _get_value_by_index(df2, idx2, map2, 'refdes'),
+            'File1 Qty': _get_value_by_index(df1, idx1, map1, 'qty'),
+            'File2 Qty': _get_value_by_index(df2, idx2, map2, 'qty'),
+            'File1 Description': _get_value_by_index(df1, idx1, map1, 'description'),
+            'File2 Description': _get_value_by_index(df2, idx2, map2, 'description'),
+            'File1 Line': idx1 + 2,
+            'File2 Line': idx2 + 2,
+            'MPN_Changed': True,
+        })
+
     # New parts (in File 2, not in File 1)
-    for k in set2 - set1:  # O(N)
+    for k in only_in_2:  # O(N)
+        if k in paired_in_2:
+            continue
         idx2 = row2_by_key.get(k)
         if idx2 is None:
             safe_print(f"Warning: Could not find valid index for new part key '{k}'")
@@ -724,7 +854,9 @@ def compare_boms(file1, file2):
         })
     
     # Removed parts (in File 1, not in File 2)
-    for k in set1 - set2:  # O(N)
+    for k in only_in_1:  # O(N)
+        if k in paired_in_1:
+            continue
         idx1 = row1_by_key.get(k)
         if idx1 is not None:
             # Use the key 'k' directly since we already have it
@@ -807,20 +939,19 @@ def compare_boms(file1, file2):
         desc1 = _get_value_by_index(df1, idx1, map1, 'description')
         desc2 = _get_value_by_index(df2, idx2, map2, 'description')
         
-        # Normalize quantities for comparison (handle numeric vs string)
+        # Smart quantity normalization: handles unit suffixes ("10 pcs"),
+        # SI prefixes ("10K" → 10000), european decimals, and whole-number
+        # floats. Falls back to a stripped string when nothing parses.
         def normalize_qty(qty_str):
             if pd.isna(qty_str) or qty_str == '' or str(qty_str).lower() == 'nan':
                 return ''
-            try:
-                # Convert to float first, then to int if it's a whole number
-                qty_float = float(str(qty_str))
-                if qty_float == int(qty_float):
-                    return str(int(qty_float))
-                else:
-                    return str(qty_float)
-            except:
+            num = _ai_normalize_quantity(qty_str)
+            if num is None:
                 return str(qty_str).strip()
-        
+            if num == int(num):
+                return str(int(num))
+            return str(num)
+
         qty1_norm = normalize_qty(qty1)
         qty2_norm = normalize_qty(qty2)
         
@@ -845,6 +976,41 @@ def compare_boms(file1, file2):
         refdes1_norm = normalize_refdes(refdes1)
         refdes2_norm = normalize_refdes(refdes2)
         refdes_changed = refdes1_norm != refdes2_norm
+
+        # Manufacturer + Vendor diff (NEW). Same MPN with different
+        # manufacturer is a "spec change" worth flagging — packaging,
+        # supplier qualification, etc.
+        def _val(df, idx, m, want):
+            for col in df.columns:
+                col_lower = str(col).lower()
+                if want == 'manufacturer' and (col_lower in {'manufacturer','mfg','mfr'} or 'manufacturer' in col_lower or 'mfg' in col_lower or 'mfr' in col_lower) and 'part' not in col_lower:
+                    try:
+                        v = df.at[idx, col]
+                        return '' if pd.isna(v) else str(v).strip()
+                    except Exception:
+                        return ''
+                if want == 'vendor' and col_lower in {'vendor','supplier','source'}:
+                    try:
+                        v = df.at[idx, col]
+                        return '' if pd.isna(v) else str(v).strip()
+                    except Exception:
+                        return ''
+            return ''
+        mfg1 = _val(df1, idx1, map1, 'manufacturer')
+        mfg2 = _val(df2, idx2, map2, 'manufacturer')
+        vendor1 = _val(df1, idx1, map1, 'vendor')
+        vendor2 = _val(df2, idx2, map2, 'vendor')
+        mfg_changed = mfg1.upper() != mfg2.upper() and (mfg1 or mfg2)
+        vendor_changed = vendor1.upper() != vendor2.upper() and (vendor1 or vendor2)
+
+        # Description-drift heuristic: same MPN, descriptions textually
+        # different but token_set similarity < 75 — flagged as a soft
+        # "review" finding, not blocking.
+        try:
+            desc_sim = description_similarity(desc1, desc2)
+        except Exception:
+            desc_sim = 1.0 if desc1_norm == desc2_norm else 0.0
+        desc_drift = desc_sim < 0.75 and (str(desc1).strip() and str(desc2).strip())
         
         # Check if MPN has changed (raw values, not normalized keys)
         mpn1 = _get_value_by_index(df1, idx1, map1, 'mpn')
@@ -874,9 +1040,10 @@ def compare_boms(file1, file2):
         safe_print(f"  Desc2: '{desc2}' -> '{desc2_norm}'")
         safe_print(f"  Desc changed: {desc_changed}")
         
-        # Add to modified_parts if ANY field has changes (qty, refdes, or description)
-        # (MPN is the same since we're in the intersection of sets)
-        if qty_changed or refdes_changed or desc_changed:
+        # Add to modified_parts if ANY field has changes (qty, refdes, description,
+        # manufacturer, or vendor). MPN is the same since we're in the
+        # intersection of sets.
+        if qty_changed or refdes_changed or desc_changed or mfg_changed or vendor_changed:
             safe_print(f"  -> Adding to modified parts (ANY field changed)")
             # Get original values via O(1) index lookups
             original_mpn1 = _get_mpn_by_index(df1, idx1, map1)
@@ -896,14 +1063,27 @@ def compare_boms(file1, file2):
             modified_part = {
                 'MPN': original_mpn1,  # Use File1 MPN for display
                 'Ref Des/LOC': refdes1,  # Use File1 Ref Des for display
-                'File1 Ref Des': refdes1,  # Add File1 Ref Des
-                'File2 Ref Des': refdes2,  # Add File2 Ref Des
+                'File1 Ref Des': refdes1,
+                'File2 Ref Des': refdes2,
                 'File1 Qty': qty1,
                 'File2 Qty': qty2,
                 'File1 Description': desc1,
                 'File2 Description': desc2,
                 'File1 Line': line1_number,
-                'File2 Line': line2_number
+                'File2 Line': line2_number,
+                'File1 Manufacturer': mfg1,
+                'File2 Manufacturer': mfg2,
+                'File1 Vendor': vendor1,
+                'File2 Vendor': vendor2,
+                'Description Similarity': round(desc_sim, 2),
+                'flags': {
+                    'qty': qty_changed,
+                    'refdes': refdes_changed,
+                    'description': desc_changed,
+                    'manufacturer': mfg_changed,
+                    'vendor': vendor_changed,
+                    'description_drift': desc_drift,
+                },
             }
             safe_print(f"  Final modified_part: {modified_part}")
             modified_parts.append(modified_part)
@@ -927,6 +1107,13 @@ def compare_boms(file1, file2):
                 'Line Number': line_number
             })
     
+    # Description-drift bucket — same MPN, big description rewrite.
+    # We list these separately so they're easy to triage.
+    description_drift_parts = [
+        m for m in modified_parts
+        if isinstance(m.get('flags'), dict) and m['flags'].get('description_drift')
+    ]
+
     # Summary statistics
     summary_stats = {
         'total_parts_file1': len(set1),
@@ -935,7 +1122,11 @@ def compare_boms(file1, file2):
         'removed_parts_count': len(removed_parts),
         'modified_parts_count': len(modified_parts),
         'unchanged_parts_count': len(unchanged_parts),
-        'unrecognized_parts_count': len(unrecognized_parts)
+        'unrecognized_parts_count': len(unrecognized_parts),
+        'mpn_renamed_count': sum(1 for m in modified_parts if m.get('MPN_Changed')),
+        'duplicate_mpn_count': len(duplicate_warnings),
+        'description_drift_count': len(description_drift_parts),
+        'fuzzy_threshold': fuzzy_threshold,
     }
     
     # Convert all values to strings for web display
@@ -962,10 +1153,14 @@ def compare_boms(file1, file2):
         'modified_parts': to_str_dict_list(modified_parts),
         'unchanged_parts': to_str_dict_list(unchanged_parts),
         'unrecognized_parts': to_str_dict_list(unrecognized_parts),
-        'summary_stats': summary_stats
+        'description_drift_parts': to_str_dict_list(description_drift_parts),
+        'duplicate_mpn_warnings': duplicate_warnings,
+        'summary_stats': summary_stats,
     }
 
-def compare_boms_manual(file1, file2, manual_map1, manual_map2):
+def compare_boms_manual(file1, file2, manual_map1, manual_map2,
+                         fuzzy_threshold: float = 0.88,
+                         ignore_pairs: Optional[List[Tuple[str, str]]] = None):
     """Compare two BOM files using manually specified column mappings."""
     safe_print("Starting manual BOM comparison...")
 
@@ -973,31 +1168,17 @@ def compare_boms_manual(file1, file2, manual_map1, manual_map2):
     ext1 = os.path.splitext(file1)[1].lower()
     ext2 = os.path.splitext(file2)[1].lower()
 
-    # Read files with headers
-    if ext1 == '.xls':
-        df1_raw = pd.read_excel(file1, header=None, engine='xlrd')
-    else:
-        df1_raw = pd.read_excel(file1, header=None)
-
-    if ext2 == '.xls':
-        df2_raw = pd.read_excel(file2, header=None, engine='xlrd')
-    else:
-        df2_raw = pd.read_excel(file2, header=None)
+    # Read files with headers (cached so we don't read the same xlsx 4x)
+    df1_raw = read_excel_cached(file1, header=None)
+    df2_raw = read_excel_cached(file2, header=None)
 
     # Find header rows automatically (we still need this to know where data starts)
     header_row1, _ = find_header_row_and_map(file1)
     header_row2, _ = find_header_row_and_map(file2)
 
-    # Read files with proper headers
-    if ext1 == '.xls':
-        df1 = pd.read_excel(file1, header=header_row1, engine='xlrd')
-    else:
-        df1 = pd.read_excel(file1, header=header_row1)
-
-    if ext2 == '.xls':
-        df2 = pd.read_excel(file2, header=header_row2, engine='xlrd')
-    else:
-        df2 = pd.read_excel(file2, header=header_row2)
+    # Read files with proper headers (cached; we copy since downstream mutates)
+    df1 = read_excel_cached(file1, header=header_row1).copy()
+    df2 = read_excel_cached(file2, header=header_row2).copy()
 
     safe_print(f"File 1 columns: {list(df1.columns)}")
     safe_print(f"File 2 columns: {list(df2.columns)}")
@@ -1026,9 +1207,14 @@ def compare_boms_manual(file1, file2, manual_map1, manual_map2):
     safe_print(f"Using MPN columns: '{mpn_col1}' and '{mpn_col2}'")
 
     # Now call the comparison logic (reuse the logic from compare_boms but with manual mappings)
-    return _perform_comparison_with_mappings(df1, df2, manual_map1, manual_map2, header_row1, header_row2)
+    return _perform_comparison_with_mappings(
+        df1, df2, manual_map1, manual_map2, header_row1, header_row2,
+        fuzzy_threshold=fuzzy_threshold, ignore_pairs=ignore_pairs,
+    )
 
-def _perform_comparison_with_mappings(df1, df2, map1, map2, header_row1, header_row2):
+def _perform_comparison_with_mappings(df1, df2, map1, map2, header_row1, header_row2,
+                                       fuzzy_threshold: float = 0.88,
+                                       ignore_pairs: Optional[List[Tuple[str, str]]] = None):
     """Perform the actual comparison using provided column mappings."""
 
     # Normalize values (reuse from compare_boms)
@@ -1102,8 +1288,63 @@ def _perform_comparison_with_mappings(df1, df2, map1, map2, header_row1, header_
     modified_parts = []
     unchanged_parts = []
 
-    # New parts (in File 2, not in File 1)
-    for k in set2 - set1:
+    # ── Fuzzy MPN pairing pass (manual flow) ─────────────────────────────
+    # Mirror the auto-flow's behavior so renamed-MPN detection works whether
+    # the user picks columns themselves or uses auto-detection.
+    only_in_1 = set1 - set2
+    only_in_2 = set2 - set1
+    rejected_pairs = set()
+    if ignore_pairs:
+        for a, b in ignore_pairs:
+            rejected_pairs.add((_ai_normalize_mpn(a), _ai_normalize_mpn(b)))
+
+    fuzzy_pairs: list = []
+    if only_in_1 and only_in_2:
+        used_2: set = set()
+        for k1 in only_in_1:
+            remaining = [k for k in only_in_2 if k not in used_2]
+            if not remaining:
+                break
+            canon1 = _ai_normalize_mpn(k1)
+            canon_remaining = {_ai_normalize_mpn(k): k for k in remaining}
+            match = find_fuzzy_mpn_match(canon1, list(canon_remaining.keys()), threshold=fuzzy_threshold)
+            if match is None:
+                continue
+            matched_canon, _score = match
+            if (canon1, matched_canon) in rejected_pairs:
+                continue
+            k2 = canon_remaining[matched_canon]
+            fuzzy_pairs.append((k1, k2))
+            used_2.add(k2)
+
+    paired_1 = {p[0] for p in fuzzy_pairs}
+    paired_2 = {p[1] for p in fuzzy_pairs}
+
+    for k1, k2 in fuzzy_pairs:
+        idx1 = row1_by_key.get(k1)
+        idx2 = row2_by_key.get(k2)
+        if idx1 is None or idx2 is None:
+            continue
+        modified_parts.append({
+            'MPN': _get_mpn_by_index(df1, idx1, map1),
+            'File1 MPN': _get_mpn_by_index(df1, idx1, map1),
+            'File2 MPN': _get_mpn_by_index(df2, idx2, map2),
+            'Ref Des/LOC': _get_value_by_mapping(df1, idx1, map1, 'refdes'),
+            'File1 Ref Des': _get_value_by_mapping(df1, idx1, map1, 'refdes'),
+            'File2 Ref Des': _get_value_by_mapping(df2, idx2, map2, 'refdes'),
+            'File1 Qty': _get_value_by_mapping(df1, idx1, map1, 'qty'),
+            'File2 Qty': _get_value_by_mapping(df2, idx2, map2, 'qty'),
+            'File1 Description': _get_value_by_mapping(df1, idx1, map1, 'description'),
+            'File2 Description': _get_value_by_mapping(df2, idx2, map2, 'description'),
+            'File1 Line': idx1 + header_row1 + 2,
+            'File2 Line': idx2 + header_row2 + 2,
+            'MPN_Changed': True,
+        })
+
+    # New parts (in File 2, not in File 1, minus paired)
+    for k in only_in_2:
+        if k in paired_2:
+            continue
         idx2 = row2_by_key.get(k)
         if idx2 is None:
             continue
@@ -1119,8 +1360,10 @@ def _perform_comparison_with_mappings(df1, df2, map1, map2, header_row1, header_
             'Line Number': line_number
         })
 
-    # Removed parts (in File 1, not in File 2)
-    for k in set1 - set2:
+    # Removed parts (in File 1, not in File 2, minus paired)
+    for k in only_in_1:
+        if k in paired_1:
+            continue
         idx1 = row1_by_key.get(k)
         if idx1 is None:
             continue
@@ -1221,7 +1464,9 @@ def _perform_comparison_with_mappings(df1, df2, map1, map2, header_row1, header_
         'removed_parts_count': len(removed_parts),
         'modified_parts_count': len(modified_parts),
         'unchanged_parts_count': len(unchanged_parts),
-        'unrecognized_parts_count': 0
+        'unrecognized_parts_count': 0,
+        'mpn_renamed_count': sum(1 for m in modified_parts if m.get('MPN_Changed')),
+        'fuzzy_threshold': fuzzy_threshold,
     }
 
     # Convert all values to strings for web display

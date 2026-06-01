@@ -21,6 +21,11 @@ from typing import Dict, List, Tuple, Optional
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
 from excel_tool import find_header_row_and_map
+from ai_helpers import (
+    classify_column,
+    score_column_content,
+    is_mpn_like,
+)
 
 
 # Error messages for graceful failures
@@ -672,6 +677,28 @@ def _is_table_data_valid(table: List) -> bool:
     return True
 
 
+def _infer_page_rotation(page) -> int:
+    """
+    Best-effort guess of page rotation when /Rotate is missing.
+
+    Many engineering drawings store landscape content on a portrait page
+    (8.5x11) and rely on the renderer to know which way is up. We sniff the
+    word orientations: if the dominant `upright` flag in extract_words is
+    False, the content is sideways and we should rotate 90°. Cheap and
+    conservative — only returns 90/270 if there's strong signal.
+    """
+    try:
+        words = page.extract_words(extra_attrs=["upright"]) or []
+    except Exception:
+        return 0
+    if not words:
+        return 0
+    sideways = sum(1 for w in words if w.get("upright") is False)
+    if sideways > len(words) * 0.6:
+        return 90
+    return 0
+
+
 def detect_bom_table(pdf_path: str) -> Dict:
     """
     Detect the primary BOM table using multi-factor scoring.
@@ -693,7 +720,18 @@ def detect_bom_table(pdf_path: str) -> Dict:
 
     with pdfplumber.open(pdf_path) as pdf:
         for page_num, page in enumerate(pdf.pages):
-            # Extract all tables from page
+            # Auto-rotate landscape engineering-drawing pages so word coords
+            # come out in reading order. pdfplumber inherits the PDF's
+            # /Rotate value but some drawings store rotation as 0 even
+            # though the content is sideways; in that case, detecting
+            # rotation here costs little (cheap heuristic — see helper).
+            rotation = getattr(page, "rotation", 0) or _infer_page_rotation(page)
+            if rotation in (90, 180, 270):
+                try:
+                    page = page.rotate(360 - rotation)  # bring back to upright
+                except Exception:
+                    pass
+
             tables = page.extract_tables()
 
             for table_idx, table in enumerate(tables):
@@ -787,18 +825,39 @@ def detect_bom_table(pdf_path: str) -> Dict:
 
     # Take highest-scoring table
     best_table = candidates[0]
+    best_col_count = len(best_table['header']) if best_table['header'] else 0
 
-    # Check for multi-page continuation
-    # If multiple tables have similar scores and same header structure, merge them
-    merged_table = best_table['table']
+    # Multi-page continuation merge — be generous so we capture all rows,
+    # even when continuation pages don't repeat the header.
+    # Strategy:
+    #   1) Same columns + matching header → strip the duplicate header, append data.
+    #   2) Same columns + NO matching header → treat the entire continuation
+    #      as data (no row to strip) — this catches Page 2..N of long BOMs that
+    #      omit the repeated header.
+    #   3) Page is later in document order than the best table.
+    merged_table = list(best_table['table'])
     pages = [best_table['page']]
 
     for candidate in candidates[1:]:
-        # Same header structure + high score = continuation
-        if (candidate['score'] >= best_table['score'] * 0.8 and
-            _headers_match(best_table['header'], candidate['header'])):
-            merged_table.extend(candidate['table'][1:])  # Skip duplicate header
-            pages.append(candidate['page'])
+        # Skip pages earlier than best_table's page (continuations come after)
+        if candidate['page'] < best_table['page']:
+            continue
+        cand_col_count = len(candidate['header']) if candidate['header'] else 0
+        if cand_col_count != best_col_count or cand_col_count == 0:
+            continue
+
+        if _headers_match(best_table['header'], candidate['header']):
+            # Strip duplicate header, append data rows.
+            merged_table.extend(candidate['table'][1:])
+            if candidate['page'] not in pages:
+                pages.append(candidate['page'])
+        elif candidate['score'] >= best_table['score'] * 0.35:
+            # Same column count, no header repeat — treat all rows as data.
+            # 0.35 multiplier accepts continuation tables that score lower
+            # because they have no header keywords on a data-only page.
+            merged_table.extend(candidate['table'])
+            if candidate['page'] not in pages:
+                pages.append(candidate['page'])
 
     # Convert to DataFrame
     df = pd.DataFrame(merged_table[1:], columns=merged_table[0])
@@ -858,66 +917,51 @@ def split_merged_cells(df: pd.DataFrame) -> pd.DataFrame:
 
 def consolidate_multiline_items(df: pd.DataFrame, mpn_col: str, desc_col: str) -> pd.DataFrame:
     """
-    Merge rows where MPN is empty (indicates description continuation).
+    Merge runs of rows where MPN is empty (description continuation).
 
-    Logic:
-    - Scan for rows with empty MPN
-    - If previous row has MPN, this is a continuation
-    - Concatenate description to previous row with newline
-    - Mark row for deletion
-    - Keep first row's Qty/RefDes values
-
-    Args:
-        df: DataFrame with potential multi-line items
-        mpn_col: Name of MPN column
-        desc_col: Name of Description column
-
-    Returns:
-        DataFrame with multi-line items consolidated
+    Improvement over the previous version: handles description spans of any
+    length, not just 1 continuation row. Each empty-MPN row that follows a
+    valid MPN row appends its description to the parent row's description
+    (newline-joined) until we hit another non-empty MPN.
     """
     df = df.copy()
-    rows_to_delete = []
+    rows_to_delete: list = []
 
-    for idx in range(1, len(df)):  # Start from row 1
+    def _scalar(v):
+        if isinstance(v, pd.Series):
+            return v.iloc[0] if len(v) > 0 else None
+        return v
+
+    parent_idx = None
+    for idx in range(len(df)):
         try:
-            current_mpn = df.at[idx, mpn_col]
-
-            # Handle case where df.at returns a Series
-            if isinstance(current_mpn, pd.Series):
-                current_mpn = current_mpn.iloc[0] if len(current_mpn) > 0 else None
-
-            if pd.isna(current_mpn) or str(current_mpn).strip() == '':
-                prev_idx = idx - 1
-
-                # Check if previous row has MPN (valid BOM item)
-                prev_mpn = df.at[prev_idx, mpn_col]
-                if isinstance(prev_mpn, pd.Series):
-                    prev_mpn = prev_mpn.iloc[0] if len(prev_mpn) > 0 else None
-
-                if not (pd.isna(prev_mpn) or str(prev_mpn).strip() == ''):
-                    # Concatenate description
-                    prev_desc_val = df.at[prev_idx, desc_col]
-                    current_desc_val = df.at[idx, desc_col]
-
-                    # Handle Series returns
-                    if isinstance(prev_desc_val, pd.Series):
-                        prev_desc_val = prev_desc_val.iloc[0] if len(prev_desc_val) > 0 else None
-                    if isinstance(current_desc_val, pd.Series):
-                        current_desc_val = current_desc_val.iloc[0] if len(current_desc_val) > 0 else None
-
-                    prev_desc = str(prev_desc_val) if not pd.isna(prev_desc_val) else ''
-                    current_desc = str(current_desc_val) if not pd.isna(current_desc_val) else ''
-
-                    if current_desc.strip():
-                        combined = f"{prev_desc}\n{current_desc}".strip() if prev_desc.strip() else current_desc
-                        df.at[prev_idx, desc_col] = combined
-
-                    rows_to_delete.append(idx)
+            current_mpn = _scalar(df.at[idx, mpn_col])
         except (KeyError, IndexError):
-            # Skip if column doesn't exist
+            parent_idx = None
             continue
 
-    # Drop continuation rows
+        is_empty = pd.isna(current_mpn) or str(current_mpn).strip() == ''
+        if not is_empty:
+            parent_idx = idx
+            continue
+
+        if parent_idx is None:
+            continue
+
+        # This row is a continuation. Merge its description into the parent.
+        try:
+            current_desc = _scalar(df.at[idx, desc_col])
+            current_desc_str = '' if pd.isna(current_desc) else str(current_desc).strip()
+            if current_desc_str:
+                prev_desc = _scalar(df.at[parent_idx, desc_col])
+                prev_desc_str = '' if pd.isna(prev_desc) else str(prev_desc).strip()
+                df.at[parent_idx, desc_col] = (
+                    f"{prev_desc_str}\n{current_desc_str}" if prev_desc_str else current_desc_str
+                )
+            rows_to_delete.append(idx)
+        except (KeyError, IndexError):
+            continue
+
     if rows_to_delete:
         df = df.drop(rows_to_delete).reset_index(drop=True)
 
@@ -987,69 +1031,16 @@ def align_and_clean(df: pd.DataFrame) -> pd.DataFrame:
 
 def detect_column_type(col_name: str) -> Optional[str]:
     """
-    Detect what type of column this is based on header name.
+    Detect column type from header name.
 
     Returns one of: 'item_number', 'manufacturer', 'mpn', 'customer_pn',
-                    'vendor', 'vendor_pn', 'qty', 'refdes', 'description', None
+                    'vendor', 'vendor_pn', 'qty', 'refdes', 'description',
+                    'revision', None.
+
+    Backed by ai_helpers.classify_column (fuzzy + priority-substring matching),
+    so typos like "Manuf. P/N" or "Mfctr. Part #" still resolve correctly.
     """
-    col_lower = str(col_name).lower().strip()
-
-    # Item Number detection
-    if any(kw in col_lower for kw in ['item number', 'item #', 'item no', 'line number', 'line #', 'line no']):
-        # But not if it's "part number" or "model number"
-        if 'part' not in col_lower and 'model' not in col_lower:
-            return 'item_number'
-
-    # Manufacturer detection (name, not part number)
-    if any(kw in col_lower for kw in ['manufacturer name', 'mfg name', 'mfr name']):
-        return 'manufacturer'
-    if col_lower in ['manufacturer', 'mfg', 'mfr', 'manufacturer:', 'mfg:', 'mfr:']:
-        return 'manufacturer'
-
-    # MPN detection (Manufacturer Part Number)
-    if any(kw in col_lower for kw in ['model number', 'model no', 'model #']):
-        return 'mpn'
-    if any(kw in col_lower for kw in ['manufacturer part', 'manufacturer pn', 'manufacturer p/n',
-                                       'mfg pn', 'mfg p/n', 'mfg part', 'mfr pn', 'mfr p/n']):
-        return 'mpn'
-    if any(kw in col_lower for kw in ['mpn', 'part number', 'part #', 'part no', 'p/n', 'pn']):
-        # But not if it's vendor/supplier/customer part number
-        if not any(kw in col_lower for kw in ['vendor', 'supplier', 'customer', 'internal', 'kjr']):
-            return 'mpn'
-
-    # Customer/Internal Part Number detection
-    if any(kw in col_lower for kw in ['customer pn', 'customer p/n', 'customer part',
-                                       'internal pn', 'internal p/n', 'company pn',
-                                       'kjr p/n', 'kjr pn']):
-        return 'customer_pn'
-
-    # Vendor/Supplier Name detection
-    if any(kw in col_lower for kw in ['vendor name', 'supplier name', 'vendor:', 'supplier:']):
-        return 'vendor'
-    if col_lower in ['vendor', 'supplier', 'source']:
-        return 'vendor'
-
-    # Vendor/Supplier Part Number detection
-    if any(kw in col_lower for kw in ['vendor part', 'vendor pn', 'vendor p/n',
-                                       'supplier part', 'supplier pn', 'supplier p/n']):
-        return 'vendor_pn'
-
-    # Quantity detection
-    if any(kw in col_lower for kw in ['qty', 'quantity', 'count', 'amount', 'qty required',
-                                       'qty per', 'qty/assy', 'per assy']):
-        return 'qty'
-
-    # Reference Designator detection
-    if any(kw in col_lower for kw in ['ref des', 'refdes', 'ref desg', 'reference designator',
-                                       'designator', 'location', 'loc', 'reference', 'ref']):
-        return 'refdes'
-
-    # Description detection
-    if any(kw in col_lower for kw in ['description', 'desc', 'notes', 'comment', 'remarks',
-                                       'part description', 'component description']):
-        return 'description'
-
-    return None
+    return classify_column(col_name)
 
 
 def map_to_bom_schema(df: pd.DataFrame, extracted_headers: List) -> pd.DataFrame:
@@ -1077,12 +1068,34 @@ def map_to_bom_schema(df: pd.DataFrame, extracted_headers: List) -> pd.DataFrame
     Raises:
         ValueError: If no MPN column detected
     """
-    # Detect column types
-    column_mapping = {}
+    # Detect column types. When multiple columns map to the same type (common
+    # for MPN — "Part Number" + "Mfg Part Number" + "Vendor Part Number"),
+    # pick the one whose *actual values* score best against the type's pattern.
+    # This is the key fix for PDFs where the header looks right but the column
+    # is actually item numbers (1, 2, 3…) or empty.
+    candidates_by_type: Dict[str, List[str]] = {}
     for col in df.columns:
         col_type = detect_column_type(col)
         if col_type:
-            column_mapping[col_type] = col
+            candidates_by_type.setdefault(col_type, []).append(col)
+
+    column_mapping = {}
+    for ctype, cols in candidates_by_type.items():
+        if len(cols) == 1:
+            column_mapping[ctype] = cols[0]
+            continue
+        # Multiple candidates → score by content
+        best_col = cols[0]
+        best_score = -1.0
+        for c in cols:
+            try:
+                score = score_column_content(df[c].tolist(), ctype)
+            except Exception:
+                score = 0.0
+            if score > best_score:
+                best_score = score
+                best_col = c
+        column_mapping[ctype] = best_col
 
     # Build standardized DataFrame with ALL required columns
     standardized = pd.DataFrame()
@@ -1158,6 +1171,10 @@ def map_to_bom_schema(df: pd.DataFrame, extracted_headers: List) -> pd.DataFrame
     else:
         standardized['Quantity'] = '1'  # Default quantity
 
+    # Unit of Measure (NEW — preserves UOM where source has one)
+    if 'uom' in column_mapping:
+        standardized['UOM'] = df[column_mapping['uom']]
+
     # Reference Designators
     if 'refdes' in column_mapping:
         standardized['Reference Designators'] = df[column_mapping['refdes']]
@@ -1169,6 +1186,18 @@ def map_to_bom_schema(df: pd.DataFrame, extracted_headers: List) -> pd.DataFrame
         standardized['Description'] = df[column_mapping['description']]
     else:
         standardized['Description'] = ''
+
+    # Flag rows with alternate-MPN cells so the comparison tool can split
+    # them into primary + alternates downstream.
+    try:
+        from ai_helpers import parse_alternate_mpns
+        alt_flags = standardized['Manufacturer Part Number (MPN)'].apply(
+            lambda v: '|'.join(parse_alternate_mpns(v)[1:]) if len(parse_alternate_mpns(v)) > 1 else ''
+        )
+        if alt_flags.astype(bool).any():
+            standardized['Alternate MPNs'] = alt_flags
+    except Exception:
+        pass
 
     # Clean up: remove rows with empty MPN
     standardized = standardized[standardized['Manufacturer Part Number (MPN)'].astype(str).str.strip() != '']
@@ -1235,84 +1264,396 @@ def generate_clean_excel(df: pd.DataFrame, output_path: str) -> str:
     return output_path
 
 
-def extract_bom_from_pdf(pdf_path: str, output_excel_path: str) -> Dict:
+def _write_sheet(ws, df: pd.DataFrame) -> None:
+    """Write a DataFrame into an existing worksheet: bold header row 1, plain
+    text data from row 2, wrapped cells, auto-width, zero merged cells."""
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.value = str(col_name)
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal='left', vertical='top', wrap_text=False)
+
+    for row_idx, row_data in enumerate(df.values, start=2):
+        for col_idx, value in enumerate(row_data, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            cell.value = str(value) if pd.notna(value) else ''
+            cell.alignment = Alignment(horizontal='left', vertical='top', wrap_text=True)
+
+    for column in ws.columns:
+        max_length = 0
+        column_letter = column[0].column_letter
+        for cell in column:
+            try:
+                if cell.value:
+                    max_length = max(max_length, len(str(cell.value)))
+            except Exception:
+                pass
+        ws.column_dimensions[column_letter].width = min(max_length + 2, 50)
+
+
+def generate_two_tab_workbook(raw_df: pd.DataFrame, bom_df: pd.DataFrame, output_path: str) -> str:
     """
-    Main entry point: Extract BOM from PDF and generate clean Excel file.
+    Write the converter output as a two-sheet workbook:
 
-    Args:
-        pdf_path: Path to input PDF file
-        output_excel_path: Path where Excel file should be saved
+      * "Normal" — the table exactly as extracted from the PDF (source columns
+        and order preserved).
+      * "BOM"    — the normalized BOM (Item / Manufacturer / MPN / Qty /
+        Reference Designators / Description …).
 
-    Returns:
-        Dictionary with:
-            - success: bool
-            - excel_path: str
-            - metadata: Dict with pages_processed, rows_extracted, confidence, columns_detected
-            - warnings: List[str]
+    The "BOM" sheet is made the active *and* visually selected tab so it is the
+    one shown when the file opens. No merged cells in either sheet.
+    """
+    wb = Workbook()
 
-    Raises:
-        ValueError: If PDF validation or extraction fails
+    normal_ws = wb.active
+    normal_ws.title = "Normal"
+    _write_sheet(normal_ws, raw_df)
+
+    bom_ws = wb.create_sheet("BOM")
+    _write_sheet(bom_ws, bom_df if bom_df is not None and not bom_df.empty else raw_df)
+
+    # Make BOM the selected/active tab on open.
+    wb.active = wb.index(bom_ws)
+    for sheet in wb.worksheets:
+        sheet.sheet_view.tabSelected = (sheet is bom_ws)
+
+    for ws in wb.worksheets:
+        assert len(ws.merged_cells.ranges) == 0, "Generated Excel contains merged cells!"
+
+    wb.save(output_path)
+    return output_path
+
+
+def generate_single_sheet_workbook(df: pd.DataFrame, output_path: str, sheet_name: str = "PDF") -> str:
+    """Write a one-sheet workbook (used by 'normal' mode — any PDF → raw table)."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sheet_name[:31] or "PDF"
+    _write_sheet(ws, df)
+    assert len(ws.merged_cells.ranges) == 0, "Generated Excel contains merged cells!"
+    wb.save(output_path)
+    return output_path
+
+
+def generate_word_document(frames: List, output_path: str) -> str:
+    """
+    Write a .docx containing one heading + table per (heading, DataFrame) pair.
+
+    Used for the Word output option. Empty frames are skipped. Cells are plain
+    text (wrapped text already merged upstream), so there are no merged cells.
+    """
+    from docx import Document
+    from docx.shared import Pt
+
+    doc = Document()
+    wrote_any = False
+    for heading, df in frames:
+        if df is None or len(df) == 0:
+            continue
+        doc.add_heading(str(heading), level=1)
+        table = doc.add_table(rows=1, cols=len(df.columns))
+        table.style = "Table Grid"
+        for i, col in enumerate(df.columns):
+            cell = table.rows[0].cells[i]
+            cell.text = str(col)
+            for p in cell.paragraphs:
+                for run in p.runs:
+                    run.bold = True
+        for _, row in df.iterrows():
+            cells = table.add_row().cells
+            for i, val in enumerate(row):
+                cells[i].text = "" if pd.isna(val) else str(val)
+        doc.add_paragraph("")
+        wrote_any = True
+
+    if not wrote_any:
+        doc.add_paragraph("No table rows were extracted from this PDF.")
+
+    doc.save(output_path)
+    return output_path
+
+
+# Column layout used on the "BOM" tab — mirrors the line-item header (row 23)
+# of BOM QUOTE TEMPLATE.xlsx so the result pastes straight into the stakeholder
+# quoting workbook. "Loc" carries reference designators; "SMT/TH" (assembly
+# type) is left blank because it cannot be inferred from a BOM PDF.
+QUOTE_TEMPLATE_COLUMNS = ["Item#", "Description", "Mfg", "Mfg P/N", "Qty", "SMT/TH", "Loc"]
+
+
+# Engineering-drawing header phrases the general classifier doesn't know.
+# MIL-STD-100 / ASME Y14.34 parts lists label the part-number column
+# "PART OR IDENTIFYING NO." and the CAGE column "CODE IDENT". Checked as a
+# fallback only — local to the converter so the shared comparison classifier
+# (ai_helpers) is untouched.
+_ENGINEERING_HEADER_HINTS = [
+    ("part or identifying", "mpn"),
+    ("part identifying", "mpn"),
+    ("identifying no", "mpn"),
+    ("identifying number", "mpn"),
+    ("nomenclature", "description"),
+    ("qty reqd", "qty"),
+    ("qty req", "qty"),
+    ("reference designation", "refdes"),
+]
+
+
+def _detect_col_type_eng(col) -> Optional[str]:
+    """detect_column_type() with an engineering-drawing header fallback."""
+    ctype = detect_column_type(str(col))
+    if ctype:
+        return ctype
+    norm = str(col).strip().lower()
+    for needle, t in _ENGINEERING_HEADER_HINTS:
+        if needle in norm:
+            return t
+    return None
+
+
+def _pick_best_columns(df: pd.DataFrame) -> Dict[str, str]:
+    """Map each canonical type to its best source column. When several columns
+    share a type (e.g. two "Part Number" columns), pick the one whose *values*
+    score highest for that type — header is a hint, content is proof."""
+    candidates: Dict[str, List[str]] = {}
+    for col in df.columns:
+        ctype = _detect_col_type_eng(col)
+        if ctype:
+            candidates.setdefault(ctype, []).append(col)
+
+    chosen: Dict[str, str] = {}
+    for ctype, cols in candidates.items():
+        if len(cols) == 1:
+            chosen[ctype] = cols[0]
+            continue
+        best_col, best_score = cols[0], -1.0
+        for c in cols:
+            try:
+                score = score_column_content(df[c].tolist(), ctype)
+            except Exception:
+                score = 0.0
+            if score > best_score:
+                best_score, best_col = score, c
+        chosen[ctype] = best_col
+    return chosen
+
+
+def map_to_quote_template_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Map an extracted table to the BOM QUOTE TEMPLATE column layout
+    (Item# | Description | Mfg | Mfg P/N | Qty | SMT/TH | Loc).
+
+    This is the "BOM" tab. The lossless raw table lives on the "Normal" tab, so
+    here we keep only the stakeholder columns and drop rows that carry neither a
+    part number nor a description (header echoes, note lines, blanks).
+    """
+    chosen = _pick_best_columns(df)
+
+    out = pd.DataFrame()
+    out["Item#"] = (
+        df[chosen["item_number"]].astype(str)
+        if "item_number" in chosen else [str(i) for i in range(1, len(df) + 1)]
+    )
+    out["Description"] = df[chosen["description"]].astype(str) if "description" in chosen else ""
+    out["Mfg"] = df[chosen["manufacturer"]].astype(str) if "manufacturer" in chosen else ""
+    out["Mfg P/N"] = df[chosen["mpn"]].astype(str) if "mpn" in chosen else ""
+    out["Qty"] = df[chosen["qty"]].astype(str) if "qty" in chosen else ""
+    out["SMT/TH"] = ""
+    out["Loc"] = df[chosen["refdes"]].astype(str) if "refdes" in chosen else ""
+
+    # Keep only real line items: must have a part number or a description.
+    def _has(v) -> bool:
+        s = str(v).strip().lower()
+        return s not in ("", "nan", "none")
+
+    mask = out["Mfg P/N"].apply(_has) | out["Description"].apply(_has)
+    out = out[mask].reset_index(drop=True)
+    # Renumber Item# sequentially if the source had no usable item column.
+    if "item_number" not in chosen:
+        out["Item#"] = [str(i) for i in range(1, len(out) + 1)]
+    return out
+
+
+def _extract_generic_tables_from_pdf(pdf_path: str) -> Optional[Dict]:
+    """Generic fallback: pull whatever table(s) pdfplumber finds, no BOM scoring."""
+    all_tables: List[List[List[str]]] = []
+    pages: List[int] = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            for table in page.extract_tables() or []:
+                if table and len(table) >= 2 and _is_table_data_valid(table):
+                    all_tables.append(table)
+                    pages.append(page_num + 1)
+    if not all_tables:
+        return None
+    primary = all_tables[0]
+    df = pd.DataFrame(primary[1:], columns=[
+        (str(c).strip() if c is not None else f"Column {i + 1}")
+        for i, c in enumerate(primary[0])
+    ])
+    # De-duplicate blank/repeated column names.
+    seen: Dict[str, int] = {}
+    new_cols: List[str] = []
+    for i, c in enumerate(df.columns):
+        n = c or f"Column {i + 1}"
+        seen[n] = seen.get(n, 0) + 1
+        if seen[n] > 1:
+            n = f"{n} ({seen[n]})"
+        new_cols.append(n)
+    df.columns = new_cols
+    return {
+        'table_data': df,
+        'header_row': list(df.columns),
+        'confidence': 0.5,  # unknown — mark as medium
+        'page_numbers': pages[:1],
+    }
+
+
+def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
+                         mode: str = "bom", out_format: str = "excel") -> Dict:
+    """
+    Main entry point: extract a table from a PDF and write the output file.
+
+    mode:
+        "bom"    — BOM-aware: normalize to the BOM/quote schema, AI vision
+                   fallback for dense drawings. Excel output is two sheets
+                   ("Normal" raw + "BOM", BOM first); Word output is both tables.
+        "normal" — generic any-PDF table extraction, raw, single sheet/table.
+    out_format:
+        "excel" (.xlsx) or "word" (.docx).
+
+    Returns a dict whose 'preview' holds the rows/columns the UI should show
+    (the BOM table for bom mode, the raw table for normal mode).
     """
     warnings = []
+    is_bom_like = True
+    mode = (mode or "bom").lower()
+    out_format = (out_format or "excel").lower()
 
     # Step 1: Validate digital PDF
     validate_digital_pdf(pdf_path)
 
-    # Step 2: Detect BOM table
-    table_data = detect_bom_table(pdf_path)
+    # Step 2: Detect BOM table (with generic fallback)
+    try:
+        table_data = detect_bom_table(pdf_path)
+    except ValueError as e:
+        fallback = _extract_generic_tables_from_pdf(pdf_path)
+        if fallback is None:
+            raise ValueError(
+                "No table detected in this PDF. Ensure the PDF contains a table with "
+                "a header row and at least one data row."
+            ) from e
+        warnings.append(f"BOM detection skipped: {e}. Exporting raw table.")
+        table_data = fallback
+        is_bom_like = False
 
     if table_data['confidence'] < 0.6:
-        warnings.append(f"BOM table detected with low confidence ({table_data['confidence']:.0%}). Results may require manual review.")
+        warnings.append(f"Table detected with low confidence ({table_data['confidence']:.0%}). Results may require manual review.")
 
-    # Step 3: Normalize
+    # Keep the source's own columns and order — no BOM schema expansion.
     df = table_data['table_data']
-    df = split_merged_cells(df)
 
-    # Try to detect MPN and Description columns for multi-line consolidation
-    # Use column type detection on the header row
-    mpn_col = None
-    desc_col = None
+    if is_bom_like:
+        df = split_merged_cells(df)
+        df = remove_duplicate_headers(df, table_data['header_row'])
+        df = align_and_clean(df)
+        # Multi-line description merging (>1 continuation row supported now).
+        try:
+            mpn_col = next((c for c in df.columns if detect_column_type(c) == 'mpn'), None)
+            desc_col = next((c for c in df.columns if detect_column_type(c) == 'description'), None)
+            if mpn_col and desc_col:
+                df = consolidate_multiline_items(df, mpn_col, desc_col)
+        except Exception:
+            pass
 
-    for col in df.columns:
-        col_type = detect_column_type(str(col))
-        if col_type == 'mpn' and mpn_col is None:
-            mpn_col = col
-        elif col_type == 'description' and desc_col is None:
-            desc_col = col
+    extraction_method = table_data.get('extraction_method', 'tables')
 
-    # If not found, use position-based fallbacks
-    if mpn_col is None:
-        # Look for first column with MPN-like data
+    # Hybrid accuracy (BOM mode only): when the deterministic text path is weak
+    # — low confidence or almost no rows on a dense engineering drawing — fall
+    # back to the local Ollama vision model, which reads glyphs precisely
+    # (5≠S, 0≠O) and reconstructs rows the geometry parser misses. No-op (text
+    # result kept) when the vision deps / Ollama server are unavailable.
+    if mode == "bom" and (table_data['confidence'] < 0.6 or len(df) < 2):
+        try:
+            from vision_tool import extract_bom_via_vision, vision_available
+            if vision_available():
+                vision_df = extract_bom_via_vision(pdf_path)
+                if vision_df is not None and len(vision_df) > len(df):
+                    df = vision_df
+                    extraction_method = 'ollama-vision'
+                    warnings.append(
+                        "Low-confidence text extraction — used local AI vision (Ollama) for accuracy."
+                    )
+        except Exception as e:
+            warnings.append(f"AI vision fallback unavailable: {e}")
+
+    raw_df = df
+    bom_df = None
+
+    if mode == "bom":
+        # BOM-aware output. "Normal" raw + "BOM" (quote-template layout). BOM
+        # mapping is best-effort — on failure the BOM tab mirrors the raw table.
+        try:
+            bom_df = map_to_quote_template_schema(df)
+        except Exception as e:
+            bom_df = df
+            warnings.append(f"BOM normalization fell back to raw table: {e}")
+        preview_df = bom_df if (bom_df is not None and not bom_df.empty) else raw_df
+        if out_format == "word":
+            generate_word_document(
+                [("BOM", bom_df), ("Normal (raw extraction)", raw_df)], output_excel_path)
+            sheets = ["BOM", "Normal (raw extraction)"]
+        else:
+            generate_two_tab_workbook(raw_df, bom_df, output_excel_path)
+            sheets = ["Normal", "BOM"]
+    else:
+        # Normal: any PDF → raw table, single sheet/table, no BOM normalization.
+        preview_df = raw_df
+        if out_format == "word":
+            generate_word_document([("PDF", raw_df)], output_excel_path)
+            sheets = ["PDF"]
+        else:
+            generate_single_sheet_workbook(raw_df, output_excel_path, sheet_name="PDF")
+            sheets = ["PDF"]
+
+    # Per-column confidence — content-pattern score per detected type. Lets
+    # the UI flag specific weak columns ("Qty: 60% — review qty mapping")
+    # instead of a single global confidence.
+    column_confidence: Dict[str, float] = {}
+    try:
+        from ai_helpers import score_column_content
         for col in df.columns:
-            if df[col].astype(str).str.len().mean() < 30:  # Short strings = likely MPN
-                mpn_col = col
-                break
-        if mpn_col is None:
-            mpn_col = df.columns[1] if len(df.columns) > 1 else df.columns[0]
+            ctype = detect_column_type(str(col))
+            if ctype:
+                try:
+                    column_confidence[str(col)] = round(score_column_content(df[col].tolist(), ctype), 2)
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
-    if desc_col is None:
-        # Look for last text column (usually description)
-        desc_col = df.columns[-1]
-
-    df = consolidate_multiline_items(df, mpn_col, desc_col)
-
-    df = remove_duplicate_headers(df, table_data['header_row'])
-    df = align_and_clean(df)
-
-    # Step 4: Map to BOM schema
-    standardized_df = map_to_bom_schema(df, table_data['header_row'])
-
-    # Step 5: Generate Excel
-    generate_clean_excel(standardized_df, output_excel_path)
+    # Preview the table the user actually asked for: the BOM table in bom mode,
+    # the raw table in normal mode. Works for both Excel and Word output.
+    preview_cols = [str(c) for c in preview_df.columns]
+    preview_rows = [["" if pd.isna(v) else str(v) for v in row] for row in preview_df.values]
 
     return {
         'success': True,
         'excel_path': output_excel_path,
+        'preview': {
+            'columns': preview_cols,
+            'rows': preview_rows,
+            'total_rows': len(preview_df),
+        },
         'metadata': {
             'pages_processed': table_data['page_numbers'],
-            'rows_extracted': len(standardized_df),
+            'rows_extracted': len(df),
             'confidence': table_data['confidence'],
-            'columns_detected': list(standardized_df.columns)
+            'columns_detected': list(df.columns),
+            'column_confidence': column_confidence,
+            'extraction_method': extraction_method,
+            'mode': mode,
+            'format': out_format,
+            'bom_rows': len(bom_df) if bom_df is not None else 0,
+            'sheets': sheets,
         },
         'warnings': warnings
     }

@@ -8,12 +8,38 @@ services:
       - "8000:8000"
     environment:
       - DATABASE_URL=postgresql://bom_compare_user:postgres@aci-database:5432/bom_compare
+      # The 'ollama' sidecar (below) powers the BOM vision fallback (free,
+      # on-server, reuses the host's already-pulled models). If it is
+      # unreachable the fallback is skipped (no error) and the deterministic
+      # text extractor is used. Tiles/pages kept modest because the server is
+      # CPU-only. Tunables: BOM_VISION_MODEL/DPI/MAX_TILES/MAX_PAGES.
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
+      - BOM_VISION_MODEL=${BOM_VISION_MODEL:-minicpm-v}
+      - BOM_VISION_MAX_TILES=${BOM_VISION_MAX_TILES:-6}
+      - BOM_VISION_MAX_PAGES=${BOM_VISION_MAX_PAGES:-2}
+    depends_on:
+      - ollama
     restart: unless-stopped
     networks:
       - app-network
       - db-consolidation_aci-network
     volumes:
       - ./data:/app/data
+
+  # Vision model server for the BOM fallback. Reuses the host's already-pulled
+  # models (read-only bind of the host Ollama store) so there is no re-download,
+  # and runs on the app-network so the backend reaches it without crossing the
+  # host firewall. CPU-only on this host.
+  ollama:
+    image: ollama/ollama:latest
+    container_name: bom_comparison_ollama
+    volumes:
+      # Mount only the model blobs read-only; the container owns the rest of
+      # /root/.ollama (key, config) on its own writable layer.
+      - /usr/share/ollama/.ollama/models:/root/.ollama/models:ro
+    restart: unless-stopped
+    networks:
+      - app-network
 
   frontend:
     build:

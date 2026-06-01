@@ -5,9 +5,22 @@ import './globals.css'
 const inter = Inter({ subsets: ['latin'] })
 
 export const metadata: Metadata = {
-  title: 'BOM Comparison Tool',
-  description: 'Compare Bill of Materials Excel files with intelligent column detection',
+  title: 'Tool Suite — American Circuits',
+  description: 'Convert PDF/JPG/PNG BOMs to Excel and compare Excel BOMs with AI-assisted column detection',
 }
+
+// Early theme resolver — runs before React hydrates to prevent
+// a flash of the wrong theme. Reads localStorage, falls back to
+// prefers-color-scheme.
+const themeInit = `
+(function(){
+  try {
+    var t = localStorage.getItem('theme');
+    if (!t) t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    if (t === 'dark') document.documentElement.classList.add('dark');
+  } catch(e) {}
+})();
+`;
 
 export default function RootLayout({
   children,
@@ -15,7 +28,10 @@ export default function RootLayout({
   children: React.ReactNode
 }) {
   return (
-    <html lang="en">
+    <html lang="en" suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: themeInit }} />
+      </head>
       <body className={inter.className}>{children}</body>
     </html>
   )

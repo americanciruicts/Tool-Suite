@@ -103,6 +103,41 @@ def _build_preview_payload(excel_path: str, output_filename: str, result: Dict, 
         "warnings": result.get("warnings", []),
     }
 
+
+_MIME = {
+    "excel": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "word": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
+
+
+def _build_convert_payload(output_path: str, output_filename: str, out_format: str,
+                           result: Dict, max_preview_rows: int = 200) -> Dict:
+    """Build the converter response from the extractor's own preview rows (works
+    for both Excel and Word output — no need to re-read the file for a preview)
+    plus the base64-encoded output file and its MIME type."""
+    preview = result.get("preview", {}) or {}
+    columns = preview.get("columns", [])
+    rows = preview.get("rows", [])
+    total_rows = preview.get("total_rows", len(rows))
+
+    with open(output_path, "rb") as f:
+        file_bytes = f.read()
+
+    return {
+        "success": True,
+        "filename": output_filename,
+        "columns": columns,
+        "rows": rows[:max_preview_rows],
+        "total_rows": total_rows,
+        "preview_truncated": total_rows > max_preview_rows,
+        # Kept as `excel_base64` for frontend compatibility — it's the output
+        # file bytes regardless of format; `mime` says how to download it.
+        "excel_base64": base64.b64encode(file_bytes).decode("ascii"),
+        "mime": _MIME.get(out_format, _MIME["excel"]),
+        "metadata": result.get("metadata", {}),
+        "warnings": result.get("warnings", []),
+    }
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -514,12 +549,20 @@ async def compare_files(
         )
 
 @app.post("/api/pdf-to-excel")
-async def pdf_to_excel(file: UploadFile = File(...)):
+async def pdf_to_excel(
+    file: UploadFile = File(...),
+    mode: str = Form("bom"),
+    output_format: str = Form("excel"),
+):
     """
-    Extract BOM from PDF and generate clean Excel file.
+    Convert a PDF to Excel.
 
     Args:
-        file: PDF file containing BOM table
+        file: PDF file
+        mode: "bom"    → BOM-aware conversion: normalize to the BOM/quote schema,
+                         AI vision fallback for dense drawings. Output has two
+                         sheets ("Normal" raw + "BOM"), with BOM shown first.
+              "normal" → generic any-PDF table extraction, raw, single sheet.
 
     Returns:
         JSON with:
@@ -544,27 +587,34 @@ async def pdf_to_excel(file: UploadFile = File(...)):
             tmp_pdf.flush()
             pdf_path = tmp_pdf.name
 
-        # Cache lookup — same bytes returns the same payload instantly
-        cache_key = f"pdf:{_sha256_of(content)}"
+        mode = (mode or "bom").lower()
+        if mode not in ("bom", "normal"):
+            mode = "bom"
+        out_format = (output_format or "excel").lower()
+        if out_format not in ("excel", "word"):
+            out_format = "excel"
+
+        # Cache lookup — keyed on bytes + mode + format
+        cache_key = f"pdf:{mode}:{out_format}:{_sha256_of(content)}"
         cached = _cache_get(cache_key)
         if cached:
-            logger.info(f"Cache hit for PDF {file.filename}")
+            logger.info(f"Cache hit for PDF {file.filename} ({mode}/{out_format})")
             return JSONResponse(content=cached)
 
         try:
-            # Generate output filename — preserve the user's original name,
-            # only swap the extension. Don't add a "_BOM" suffix.
+            # Output filename — preserve the user's name, swap the extension to
+            # match the chosen format.
             base, _ = os.path.splitext(file.filename)
-            output_filename = f"{base}.xlsx"
+            ext = "docx" if out_format == "word" else "xlsx"
+            output_filename = f"{base}.{ext}"
             output_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_{output_filename}")
 
-            # Extract BOM from PDF
-            logger.info(f"Processing PDF: {file.filename}")
-            result = extract_bom_from_pdf(pdf_path, output_path)
+            logger.info(f"Processing PDF: {file.filename} (mode={mode}, format={out_format})")
+            result = extract_bom_from_pdf(pdf_path, output_path, mode=mode, out_format=out_format)
 
-            logger.info(f"Successfully extracted {result['metadata']['rows_extracted']} BOM items from PDF")
+            logger.info(f"Extracted {result['metadata']['rows_extracted']} rows from PDF")
 
-            payload = _build_preview_payload(output_path, output_filename, result)
+            payload = _build_convert_payload(output_path, output_filename, out_format, result)
             _cache_put(cache_key, payload)
             return JSONResponse(content=payload)
 

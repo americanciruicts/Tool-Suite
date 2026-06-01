@@ -522,6 +522,7 @@ export default function Home() {
     total_rows: number;
     preview_truncated: boolean;
     excel_base64: string;
+    mime?: string;
     metadata?: { confidence?: number; rows_extracted?: number; pages_processed?: number | number[] };
     warnings?: string[];
   };
@@ -531,6 +532,10 @@ export default function Home() {
   const [pdfProcessing, setPdfProcessing] = useState(false);
   const [pdfError, setPdfError] = useState<string | null>(null);
   const [pdfPreview, setPdfPreview] = useState<ConvertPreview | null>(null);
+  // Conversion mode: 'bom' = BOM-aware (normalize columns, AI fallback);
+  // 'normal' = generic any-PDF table extraction. And the output file format.
+  const [pdfMode, setPdfMode] = useState<'bom' | 'normal'>('bom');
+  const [pdfFormat, setPdfFormat] = useState<'excel' | 'word'>('excel');
 
   // Image (JPG/PNG) → Excel conversion states
   const [imageFile, setImageFile] = useState<File | null>(null);
@@ -672,7 +677,7 @@ export default function Home() {
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
     const blob = new Blob([bytes], {
-      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      type: preview.mime || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     });
     const url = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -695,6 +700,8 @@ export default function Home() {
     try {
       const formData = new FormData();
       formData.append('file', pdfFile);
+      formData.append('mode', pdfMode);
+      formData.append('output_format', pdfFormat);
       const apiUrl = `${getApiBasePath()}/pdf-to-excel`;
       const response = await axios.post<ConvertPreview>(apiUrl, formData, {
         headers: {
@@ -1898,6 +1905,48 @@ export default function Home() {
         <div className="print:hidden">
           <div className="max-w-3xl mx-auto">
 
+            {/* Conversion mode + output format selectors */}
+            <div className="mb-5 flex flex-col sm:flex-row gap-4 sm:items-center sm:justify-between">
+              <div>
+                <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Conversion</p>
+                <div className="inline-flex rounded-lg border border-gray-300 bg-white p-0.5">
+                  {([
+                    ['bom', 'BOM Conversion', 'Detect & normalize the BOM (AI-assisted)'],
+                    ['normal', 'Normal PDF → Excel', 'Extract any PDF table as-is'],
+                  ] as const).map(([id, label, hint]) => (
+                    <button
+                      key={id}
+                      type="button"
+                      title={hint}
+                      onClick={() => { setPdfMode(id); setPdfPreview(null); }}
+                      className={`px-4 py-2 text-sm font-medium rounded-md transition-colors ${
+                        pdfMode === id ? 'bg-blue-600 text-white shadow-sm' : 'text-gray-600 hover:bg-gray-100'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Output format</p>
+                <div className="inline-flex rounded-lg border border-gray-300 bg-white p-0.5">
+                  {([['excel', 'Excel'], ['word', 'Word']] as const).map(([id, label]) => (
+                    <button
+                      key={id}
+                      type="button"
+                      onClick={() => { setPdfFormat(id); setPdfPreview(null); }}
+                      className={`px-4 py-2 text-sm font-medium rounded-md transition-colors ${
+                        pdfFormat === id ? 'bg-emerald-600 text-white shadow-sm' : 'text-gray-600 hover:bg-gray-100'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
             {/* Drop zone card */}
             <div className="card overflow-hidden">
               <div
@@ -1961,12 +2010,12 @@ export default function Home() {
                   {pdfProcessing ? (
                     <>
                       <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-current"></div>
-                      Extracting BOM…
+                      {pdfMode === 'bom' ? 'Extracting BOM…' : 'Converting…'}
                     </>
                   ) : (
                     <>
                       <FileDown className="w-5 h-5" />
-                      Convert to Excel
+                      Convert to {pdfFormat === 'word' ? 'Word' : 'Excel'}
                     </>
                   )}
                 </button>

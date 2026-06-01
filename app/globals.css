@@ -2,117 +2,371 @@
 @tailwind components;
 @tailwind utilities;
 
-@layer base {
-  :root {
-    --background: 0 0% 100%;
-    --foreground: 222.2 84% 4.9%;
+/* ──────────────────────────────────────────────────────────────────────
+   Design tokens. All component-level colors flow through these so
+   light/dark themes flip with one .dark class on <html>.
+   ────────────────────────────────────────────────────────────────────── */
+:root {
+  --bg:               #f7f8fb;
+  --bg-mesh-1:        rgba(99,102,241,0.10);
+  --bg-mesh-2:        rgba(168,85,247,0.07);
+  --bg-mesh-3:        rgba(59,130,246,0.06);
+  --surface:          #ffffff;
+  --surface-subtle:   #f9fafb;
+  --surface-inset:    #f3f4f6;
+  --surface-border:   #e5e7eb;
+  --text:             #0f172a;
+  --text-muted:       #475569;
+  --text-subtle:      #64748b;
+  --accent:           #4f46e5;
+  --accent-fg:        #ffffff;
+  --accent-soft:      #eef2ff;
+  --accent-border:    #c7d2fe;
+  --shadow-card:      0 1px 2px rgba(15,23,42,0.04), 0 4px 12px rgba(15,23,42,0.06);
+  --shadow-pop:       0 8px 32px -12px rgba(79,70,229,0.35);
+}
 
-    --card: 0 0% 100%;
-    --card-foreground: 222.2 84% 4.9%;
-
-    --popover: 0 0% 100%;
-    --popover-foreground: 222.2 84% 4.9%;
-
-    --primary: 221.2 83.2% 53.3%;
-    --primary-foreground: 210 40% 98%;
-
-    --secondary: 210 40% 96%;
-    --secondary-foreground: 222.2 84% 4.9%;
-
-    --muted: 210 40% 96%;
-    --muted-foreground: 215.4 16.3% 46.9%;
-
-    --accent: 210 40% 96%;
-    --accent-foreground: 222.2 84% 4.9%;
-
-    --destructive: 0 84.2% 60.2%;
-    --destructive-foreground: 210 40% 98%;
-
-    --border: 214.3 31.8% 91.4%;
-    --input: 214.3 31.8% 91.4%;
-    --ring: 221.2 83.2% 53.3%;
-
-    --radius: 0.5rem;
-  }
+.dark {
+  --bg:               #0a0e1a;
+  --bg-mesh-1:        rgba(99,102,241,0.18);
+  --bg-mesh-2:        rgba(168,85,247,0.12);
+  --bg-mesh-3:        rgba(59,130,246,0.10);
+  --surface:          #131826;
+  --surface-subtle:   #1a2030;
+  --surface-inset:    #232a3d;
+  --surface-border:   #2a3146;
+  --text:             #e7eaf2;
+  --text-muted:       #9aa3b9;
+  --text-subtle:      #6b7390;
+  --accent:           #818cf8;
+  --accent-fg:        #0a0e1a;
+  --accent-soft:      rgba(129,140,248,0.14);
+  --accent-border:    rgba(129,140,248,0.35);
+  --shadow-card:      0 1px 2px rgba(0,0,0,0.4), 0 6px 16px rgba(0,0,0,0.35);
+  --shadow-pop:       0 8px 32px -10px rgba(129,140,248,0.55);
 }
 
 @layer base {
-  * {
-    @apply border-gray-200;
+  html, body {
+    background: var(--bg);
+    color: var(--text);
   }
   body {
-    @apply bg-white text-gray-900;
+    @apply antialiased;
+    background:
+      radial-gradient(900px 500px at 8% -8%, var(--bg-mesh-1), transparent 60%),
+      radial-gradient(800px 500px at 105% 8%, var(--bg-mesh-2), transparent 60%),
+      radial-gradient(700px 400px at 50% 110%, var(--bg-mesh-3), transparent 60%),
+      var(--bg);
+    background-attachment: fixed;
+  }
+  h1, h2, h3, h4 {
+    letter-spacing: -0.02em;
+  }
+  ::selection {
+    background: var(--accent-soft);
+    color: var(--text);
+  }
+  /* Custom scrollbar — visible in both themes */
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: var(--surface-border);
+    border-radius: 999px;
+    border: 2px solid var(--bg);
+  }
+  ::-webkit-scrollbar-thumb:hover { background: var(--text-subtle); }
+}
+
+@layer utilities {
+  .surface     { background: var(--surface); }
+  .surface-subtle { background: var(--surface-subtle); }
+  .surface-inset  { background: var(--surface-inset); }
+  .border-app  { border-color: var(--surface-border); }
+  .text-app    { color: var(--text); }
+  .text-app-muted   { color: var(--text-muted); }
+  .text-app-subtle  { color: var(--text-subtle); }
+  .shadow-card { box-shadow: var(--shadow-card); }
+  .shadow-pop  { box-shadow: var(--shadow-pop); }
+  .ring-accent {
+    box-shadow: 0 0 0 1px var(--accent-border), 0 0 0 4px rgba(99,102,241,0.12);
+  }
+
+  /* Subtle dotted backdrop */
+  .bg-dots {
+    background-image: radial-gradient(rgba(15,23,42,0.08) 1px, transparent 1px);
+    background-size: 18px 18px;
+  }
+  .dark .bg-dots {
+    background-image: radial-gradient(rgba(255,255,255,0.06) 1px, transparent 1px);
+  }
+
+  /* Animations */
+  @keyframes float {
+    0%, 100% { transform: translateY(0px); }
+    50%      { transform: translateY(-3px); }
+  }
+  .animate-float { animation: float 4s ease-in-out infinite; }
+
+  @keyframes fade-up {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .animate-fade-up { animation: fade-up .35s ease-out both; }
+
+  @keyframes shimmer {
+    0%   { background-position: -400px 0; }
+    100% { background-position: 400px 0; }
+  }
+  .skeleton {
+    background: linear-gradient(90deg,
+      var(--surface-subtle) 0%,
+      var(--surface-inset)  50%,
+      var(--surface-subtle) 100%);
+    background-size: 800px 100%;
+    animation: shimmer 1.4s linear infinite;
+  }
+
+  @keyframes step-bar {
+    from { width: 0%; }
+    to   { width: 100%; }
+  }
+  .animate-step-bar { animation: step-bar 1.8s ease-in-out infinite; }
+
+  /* Card lift on hover */
+  .lift {
+    transition: transform .2s ease, box-shadow .2s ease, border-color .2s ease;
+  }
+  .lift:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 10px 30px -10px rgba(15,23,42,0.18);
   }
 }
 
 @layer components {
-  .btn-primary {
-    @apply inline-flex items-center justify-center rounded-md bg-primary-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-primary-700 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed transition-colors duration-200;
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--surface-border);
+    border-radius: 16px;
+    box-shadow: var(--shadow-card);
   }
+
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2.5 text-sm font-semibold shadow-sm transition-all duration-150 disabled:opacity-50 disabled:cursor-not-allowed;
+    background: var(--accent);
+    color: var(--accent-fg);
+  }
+  .btn-primary:hover:not(:disabled) {
+    background: #4338ca;
+    box-shadow: var(--shadow-pop);
+  }
+  .dark .btn-primary:hover:not(:disabled) { background: #6366f1; }
 
   .btn-secondary {
-    @apply inline-flex items-center justify-center rounded-md bg-white px-4 py-2 text-sm font-medium text-gray-700 shadow-sm border border-gray-300 hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed transition-colors duration-200;
+    @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2.5 text-sm font-medium transition-all duration-150 disabled:opacity-50 disabled:cursor-not-allowed;
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--surface-border);
+  }
+  .btn-secondary:hover:not(:disabled) {
+    background: var(--surface-subtle);
   }
 
-  .btn-warning {
-    @apply inline-flex items-center justify-center rounded-md bg-warning-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-warning-700 focus:outline-none focus:ring-2 focus:ring-warning-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed transition-colors duration-200;
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition-colors;
+    color: var(--text-muted);
   }
+  .btn-ghost:hover { background: var(--surface-subtle); color: var(--text); }
 
-  .card {
-    @apply bg-white rounded-lg shadow-sm border border-gray-200;
+  .nav-item {
+    @apply flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all duration-150;
+    color: var(--text-muted);
   }
+  .nav-item:hover {
+    background: var(--surface-subtle);
+    color: var(--text);
+  }
+  .nav-item-active {
+    background: var(--accent-soft);
+    color: var(--accent);
+    border: 1px solid var(--accent-border);
+  }
+  .dark .nav-item-active { color: #c7d2fe; }
 }
 
-/* Print styles */
+/* ──────────────────────────────────────────────────────────────────────
+   Dark-mode overrides for Tailwind utility classes used directly in JSX.
+   This is a compatibility layer so legacy `bg-white` / `text-gray-700`
+   etc. flip to readable colors when `.dark` is on <html>. New code
+   should prefer the .surface / .text-app / .card utilities defined
+   above, but these overrides keep the existing 1900-line page.tsx
+   readable without rewriting every class.
+   ────────────────────────────────────────────────────────────────────── */
+/* Neutrals — surfaces */
+.dark .bg-white       { background-color: var(--surface) !important; }
+.dark .bg-gray-50,
+.dark .bg-gray-50\/70 { background-color: var(--surface-subtle) !important; }
+.dark .bg-gray-50\/95 { background-color: color-mix(in oklab, var(--surface-subtle) 95%, transparent) !important; }
+.dark .bg-gray-100    { background-color: var(--surface-inset) !important; }
+.dark .bg-gray-200    { background-color: var(--surface-inset) !important; }
+
+/* Neutrals — borders */
+.dark .border-gray-100,
+.dark .border-gray-200,
+.dark .border-gray-300 { border-color: var(--surface-border) !important; }
+
+/* Neutrals — text */
+.dark .text-gray-900 { color: var(--text) !important; }
+.dark .text-gray-800 { color: var(--text) !important; }
+.dark .text-gray-700 { color: var(--text-muted) !important; }
+.dark .text-gray-600 { color: var(--text-muted) !important; }
+.dark .text-gray-500 { color: var(--text-subtle) !important; }
+.dark .text-gray-400 { color: var(--text-subtle) !important; }
+
+/* Soft tint backgrounds — dim significantly for dark mode */
+.dark .bg-blue-50    { background-color: rgba(59,130,246,0.10) !important; }
+.dark .bg-blue-100   { background-color: rgba(59,130,246,0.18) !important; }
+.dark .bg-indigo-50  { background-color: rgba(99,102,241,0.10) !important; }
+.dark .bg-indigo-100 { background-color: rgba(99,102,241,0.18) !important; }
+.dark .bg-purple-50  { background-color: rgba(168,85,247,0.10) !important; }
+.dark .bg-purple-100 { background-color: rgba(168,85,247,0.18) !important; }
+.dark .bg-green-50   { background-color: rgba(16,185,129,0.10) !important; }
+.dark .bg-green-100  { background-color: rgba(16,185,129,0.18) !important; }
+.dark .bg-emerald-50 { background-color: rgba(16,185,129,0.10) !important; }
+.dark .bg-red-50     { background-color: rgba(239,68,68,0.10) !important; }
+.dark .bg-red-100    { background-color: rgba(239,68,68,0.18) !important; }
+.dark .bg-rose-50    { background-color: rgba(244,63,94,0.10) !important; }
+.dark .bg-amber-50   { background-color: rgba(245,158,11,0.10) !important; }
+.dark .bg-amber-100  { background-color: rgba(245,158,11,0.18) !important; }
+.dark .bg-yellow-50  { background-color: rgba(234,179,8,0.10) !important; }
+
+/* Borders for the same tints */
+.dark .border-blue-200    { border-color: rgba(59,130,246,0.30) !important; }
+.dark .border-indigo-200  { border-color: rgba(99,102,241,0.30) !important; }
+.dark .border-purple-200  { border-color: rgba(168,85,247,0.30) !important; }
+.dark .border-green-200,
+.dark .border-emerald-200 { border-color: rgba(16,185,129,0.30) !important; }
+.dark .border-red-200     { border-color: rgba(239,68,68,0.30) !important; }
+.dark .border-rose-200    { border-color: rgba(244,63,94,0.30) !important; }
+.dark .border-amber-200   { border-color: rgba(245,158,11,0.30) !important; }
+
+/* Lift saturated text colors so they read on dark surfaces */
+.dark .text-blue-600,
+.dark .text-blue-700,
+.dark .text-blue-800,
+.dark .text-blue-900     { color: #93c5fd !important; }
+.dark .text-indigo-600,
+.dark .text-indigo-700   { color: #a5b4fc !important; }
+.dark .text-purple-600,
+.dark .text-purple-700   { color: #c4b5fd !important; }
+.dark .text-green-600,
+.dark .text-green-700,
+.dark .text-green-800,
+.dark .text-emerald-600,
+.dark .text-emerald-700  { color: #6ee7b7 !important; }
+.dark .text-red-600,
+.dark .text-red-700,
+.dark .text-red-800,
+.dark .text-red-900,
+.dark .text-rose-600,
+.dark .text-rose-700     { color: #fca5a5 !important; }
+.dark .text-amber-700,
+.dark .text-amber-800    { color: #fcd34d !important; }
+
+/* Solid colored backgrounds (badges/headers) — slightly muted */
+.dark .bg-blue-600,
+.dark .bg-indigo-600,
+.dark .bg-primary-600  { background-color: #4f46e5 !important; }
+.dark .bg-green-600,
+.dark .bg-emerald-600  { background-color: #059669 !important; }
+.dark .bg-red-600      { background-color: #dc2626 !important; }
+.dark .bg-amber-500,
+.dark .bg-amber-600,
+.dark .bg-warning-600  { background-color: #d97706 !important; }
+
+/* Diff-highlight cells in modified-parts table */
+.dark .bg-red-200      { background-color: rgba(239,68,68,0.22) !important; }
+.dark .border-red-500  { border-color: rgba(239,68,68,0.55) !important; }
+
+/* Dropzone hover states */
+.dark [class*="hover:bg-blue-50"]:hover   { background-color: rgba(59,130,246,0.10) !important; }
+.dark [class*="hover:bg-purple-50"]:hover { background-color: rgba(168,85,247,0.10) !important; }
+
+/* Gray hover states */
+.dark .hover\:bg-gray-50:hover  { background-color: var(--surface-subtle) !important; }
+.dark .hover\:bg-gray-100:hover { background-color: var(--surface-inset) !important; }
+
+/* kbd hint pill in image dropzone */
+.dark kbd {
+  background-color: var(--surface-inset) !important;
+  color: var(--text) !important;
+  border-color: var(--surface-border) !important;
+}
+
+/* Refined section-header pill in dark mode (more glow, less wash) */
+.dark .animate-fade-up .inline-flex {
+  box-shadow: 0 0 0 1px rgba(129,140,248,0.25), 0 6px 24px -8px rgba(129,140,248,0.45);
+}
+
+/* Processing overlay — deeper backdrop blur in dark mode */
+.dark .fixed.inset-0.z-50 {
+  background-color: rgba(0,0,0,0.55);
+}
+
+/* Sidebar nav-item-active — extra glow for visibility */
+.dark .nav-item-active {
+  box-shadow: 0 0 0 1px var(--accent-border), 0 6px 18px -8px rgba(129,140,248,0.45);
+}
+
+/* Card hover lift — deeper shadow in dark mode for readability */
+.dark .lift:hover {
+  box-shadow: 0 14px 40px -16px rgba(0,0,0,0.65), 0 0 0 1px rgba(129,140,248,0.18);
+}
+
+/* Modified-parts table — sticky MPN cell needs an explicit dark bg
+   because hardcoded bg-white in inline classes wins over the override
+   only via !important; the sticky cell uses a different class chain */
+.dark td.sticky.bg-white,
+.dark th.sticky.bg-gray-50,
+.dark .sticky[class*="bg-white"] { background-color: var(--surface) !important; }
+
+/* Comparison-results category headers — colored chevron bars need
+   contrast tweaks in dark mode */
+.dark .bg-success-600  { background-color: #059669 !important; }
+.dark .bg-danger-600,
+.dark .bg-rose-600     { background-color: #dc2626 !important; }
+.dark .bg-warning-600  { background-color: #d97706 !important; }
+
+/* The "Result (N)" preview header & file-row backgrounds — they use
+   bg-white inside .card; force them to inherit surface */
+.dark .card .bg-white { background-color: var(--surface) !important; }
+
+/* Diff-row strikethrough red in MPN renamed badge looks too saturated */
+.dark .line-through    { text-decoration-color: #fca5a5; }
+
+/* Tablerow zebra striping */
+.dark tr.bg-white      { background-color: var(--surface) !important; }
+.dark tr.bg-gray-50,
+.dark tr.bg-gray-50\/70 { background-color: var(--surface-subtle) !important; }
+
+/* Print */
 @media print {
   -webkit-print-color-adjust: exact !important;
   color-adjust: exact !important;
   print-color-adjust: exact !important;
-  
-  /* Hide page stuff */
-  .text-center,
+
   .controls,
   .grid.grid-cols-1.lg\\:grid-cols-2,
-  .search-bar {
+  .search-bar,
+  aside.app-sidebar {
     display: none !important;
   }
-  
-  /* Hide the collapse buttons and category summary bars */
-  button,
-  svg,
-  .category-section > div:first-child {
+  button, svg, .category-section > div:first-child {
     display: none !important;
   }
-  
-  /* Force all colors to print */
   * {
     -webkit-print-color-adjust: exact !important;
     color-adjust: exact !important;
     print-color-adjust: exact !important;
-  }
-  
-  /* Specific color preservation */
-  .bg-yellow-300 {
-    background-color: #fde047 !important;
-  }
-  
-  .bg-blue-50 {
-    background-color: #eff6ff !important;
-  }
-  
-  .bg-blue-100 {
-    background-color: #dbeafe !important;
-  }
-  
-  .bg-green-50 {
-    background-color: #f0fdf4 !important;
-  }
-  
-  .bg-green-100 {
-    background-color: #dcfce7 !important;
-  }
-  
-  .bg-gray-50 {
-    background-color: #f9fafb !important;
   }
 }
