@@ -77,8 +77,9 @@ def parse_bom_from_layout(pdf_path: str, max_pages: int = 6) -> Optional[pd.Data
                 break
 
         if c is None or c + 1 >= len(toks):
-            # Possibly a wrapped reference-designator line — remember it for the
-            # next data row that has no leading designators.
+            # A wrapped reference-designator line just above a row with no leading
+            # designators (kept to one line — accumulating across lines mis-attributes
+            # designators to the wrong row without coordinate info).
             if _REFDES_LINE.match(s):
                 pending_refdes = s.rstrip(",")
             continue
@@ -93,11 +94,10 @@ def parse_bom_from_layout(pdf_path: str, max_pages: int = 6) -> Optional[pd.Data
             rem = [partno] + rem
             partno = ""
 
-        # Reference designators: tokens before item#, minus a stray drawing-zone
-        # letter (e.g. "E D4,D49" → "D4,D49").
+        # Reference designators: this row's own leading tokens (minus a stray
+        # drawing-zone letter); else the single wrapped line just above it.
         if c - 2 >= 1:
-            refdes = " ".join(toks[: c - 2]).rstrip(",")
-            refdes = re.sub(r"^[A-Z]\s+", "", refdes)
+            refdes = re.sub(r"^[A-Z]\s+", "", " ".join(toks[: c - 2]).rstrip(","))
         else:
             refdes = pending_refdes
         pending_refdes = ""
@@ -141,4 +141,11 @@ def parse_bom_from_layout(pdf_path: str, max_pages: int = 6) -> Optional[pd.Data
             continue
         seen.add(key)
         out.append(r)
+
+    # Sort by item number ascending (parts lists print in descending order).
+    def _item_key(r):
+        v = str(r["Item No."]).strip()
+        return (0, int(v)) if v.isdigit() else (1, 0)
+    out.sort(key=_item_key)
+
     return pd.DataFrame(out, columns=COLUMNS)
