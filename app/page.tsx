@@ -176,13 +176,36 @@ function MethodBadge({ method }: { method?: string }) {
 function ConvertPreviewPanel({ accentColor, preview, onDownload, onReset, onGoCompare }: ConvertPreviewPanelProps) {
   const [closed, setClosed] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const [sortCol, setSortCol] = useState<number | null>(null);
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
   const accentText = accentColor === 'purple' ? 'text-purple-600' : 'text-blue-600';
 
+  // Sortable view of the rows (numeric-aware). Clicking a header cycles
+  // asc → desc → unsorted.
+  const sortedRows = (() => {
+    if (sortCol === null) return preview.rows;
+    const idx = sortCol;
+    const num = (v: string) => { const t = (v ?? '').trim(); return /^-?\d/.test(t) ? parseFloat(t.replace(/,/g, '')) : NaN; };
+    return [...preview.rows].sort((a, b) => {
+      const av = (a[idx] ?? '').trim(), bv = (b[idx] ?? '').trim();
+      const an = num(av), bn = num(bv);
+      const c = (!isNaN(an) && !isNaN(bn)) ? an - bn : av.localeCompare(bv);
+      return sortDir === 'asc' ? c : -c;
+    });
+  })();
+
+  const toggleSort = (i: number) => {
+    if (sortCol !== i) { setSortCol(i); setSortDir('asc'); }
+    else if (sortDir === 'asc') setSortDir('desc');
+    else setSortCol(null);
+  };
+
   const handleCopy = async () => {
-    // Copy TSV to clipboard — paste directly into any spreadsheet
+    // Copy TSV (current sort) to clipboard — paste directly into any spreadsheet
     const tsv = [
       preview.columns.join('\t'),
-      ...preview.rows.map(r => r.join('\t')),
+      ...sortedRows.map(r => r.join('\t')),
     ].join('\n');
     try {
       await navigator.clipboard.writeText(tsv);
@@ -192,6 +215,68 @@ function ConvertPreviewPanel({ accentColor, preview, onDownload, onReset, onGoCo
       // ignore
     }
   };
+
+  // Download exactly what's shown (current column sort) as a fresh .xlsx.
+  const downloadView = async () => {
+    try {
+      const ExcelJS = (await import('exceljs')).default;
+      const wb = new ExcelJS.Workbook();
+      const ws = wb.addWorksheet('BOM');
+      ws.addRow(preview.columns.map((c, i) => c || `Column ${i + 1}`));
+      sortedRows.forEach(r => ws.addRow(preview.columns.map((_, ci) => r[ci] ?? '')));
+      ws.getRow(1).font = { bold: true };
+      ws.columns.forEach((col: any) => { col.width = 24; });
+      const buf = await wb.xlsx.writeBuffer();
+      const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = preview.filename.replace(/\.(xlsx|docx)$/i, '') + ' (view).xlsx';
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error('download view failed', e);
+    }
+  };
+
+  // Excel-like sortable grid (row numbers, gridlines, sticky header + #col).
+  const grid = (
+    <table className="text-sm border-collapse">
+      <thead className="sticky top-0 z-10">
+        <tr>
+          <th className="sticky left-0 z-20 bg-gray-200 border border-gray-300 px-2 py-2 text-[11px] font-medium text-gray-500 w-12">#</th>
+          {preview.columns.map((col, i) => (
+            <th
+              key={i}
+              onClick={() => toggleSort(i)}
+              title="Click to sort"
+              className="border border-gray-300 bg-gray-100 px-3 py-2 text-[13px] font-semibold text-gray-700 whitespace-nowrap cursor-pointer hover:bg-gray-200 select-none"
+            >
+              <span className="inline-flex items-center gap-1">
+                {col || `Column ${i + 1}`}
+                <span className="text-gray-400 text-[10px]">{sortCol === i ? (sortDir === 'asc' ? '▲' : '▼') : '↕'}</span>
+              </span>
+            </th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {sortedRows.length === 0 && (
+          <tr><td colSpan={preview.columns.length + 1} className="px-4 py-8 text-center text-sm text-gray-500 border border-gray-200">No data rows extracted.</td></tr>
+        )}
+        {sortedRows.map((row, ri) => (
+          <tr key={ri} className={ri % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
+            <td className="sticky left-0 bg-inherit border border-gray-300 px-2 py-1.5 text-[11px] text-gray-400 text-center tabular-nums">{ri + 1}</td>
+            {preview.columns.map((_, ci) => (
+              <td key={ci} className="border border-gray-200 px-3 py-1.5 text-[13px] text-gray-800 align-top whitespace-pre-wrap break-words min-w-[80px] max-w-[420px]">
+                {row[ci] ?? ''}
+              </td>
+            ))}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
 
   return (
     <div className="mx-4 mb-4 bg-white border border-gray-200 rounded-2xl shadow-sm overflow-hidden">
@@ -227,6 +312,13 @@ function ConvertPreviewPanel({ accentColor, preview, onDownload, onReset, onGoCo
           Finished
         </span>
         <button
+          onClick={() => setExpanded(true)}
+          className="px-3 py-1.5 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors"
+          title="Full-screen spreadsheet view"
+        >
+          ⛶ Full screen
+        </button>
+        <button
           onClick={() => setClosed(c => !c)}
           className="px-3 py-1.5 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors"
         >
@@ -239,8 +331,16 @@ function ConvertPreviewPanel({ accentColor, preview, onDownload, onReset, onGoCo
           {copied ? 'Copied!' : 'Copy'}
         </button>
         <button
+          onClick={downloadView}
+          className="px-3 py-1.5 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors"
+          title="Download the sheet exactly as sorted/shown here"
+        >
+          Download view
+        </button>
+        <button
           onClick={onDownload}
           className="px-4 py-1.5 text-sm font-semibold text-white bg-gray-900 rounded-lg hover:bg-black transition-colors shadow-sm"
+          title="Download the formatted template workbook"
         >
           Download
         </button>
@@ -252,44 +352,28 @@ function ConvertPreviewPanel({ accentColor, preview, onDownload, onReset, onGoCo
         </div>
       )}
 
-      {/* Table */}
+      {/* Excel-like sortable grid */}
       {!closed && (
-        <div className="border-t border-gray-100 overflow-auto max-h-[480px]">
-          <table className="w-full text-sm">
-            <thead className="sticky top-0 z-10 shadow-[0_1px_0_0_rgba(0,0,0,0.06)]">
-              <tr>
-                {preview.columns.map((col, i) => (
-                  <th
-                    key={i}
-                    className="px-4 py-3 text-center text-[13px] font-semibold text-gray-700 whitespace-nowrap bg-gray-50/95 backdrop-blur"
-                  >
-                    {col || `Column ${i + 1}`}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {preview.rows.length === 0 && (
-                <tr>
-                  <td colSpan={preview.columns.length} className="px-4 py-8 text-center text-sm text-gray-500">
-                    No data rows extracted.
-                  </td>
-                </tr>
-              )}
-              {preview.rows.map((row, ri) => (
-                <tr key={ri} className={ri % 2 === 0 ? 'bg-white' : 'bg-gray-50/70'}>
-                  {preview.columns.map((_, ci) => (
-                    <td
-                      key={ci}
-                      className="px-4 py-3 text-[13px] text-gray-800 text-center align-middle whitespace-pre-wrap break-words"
-                    >
-                      {row[ci] ?? ''}
-                    </td>
-                  ))}
-                </tr>
-              ))}
-            </tbody>
-          </table>
+        <div className="border-t border-gray-100 overflow-auto max-h-[520px]">
+          {grid}
+        </div>
+      )}
+
+      {/* Full-screen spreadsheet view */}
+      {expanded && (
+        <div className="fixed inset-0 z-50 bg-white flex flex-col">
+          <div className="px-6 py-3 border-b border-gray-200 flex items-center justify-between gap-3 flex-wrap">
+            <p className="font-semibold text-gray-900 truncate">
+              {preview.filename} <span className="text-gray-400 font-normal">· {sortedRows.length} rows · click a header to sort</span>
+            </p>
+            <div className="flex items-center gap-2">
+              <button onClick={handleCopy} className="px-3 py-1.5 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50">{copied ? 'Copied!' : 'Copy'}</button>
+              <button onClick={downloadView} className="px-3 py-1.5 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50">Download view</button>
+              <button onClick={onDownload} className="px-4 py-1.5 text-sm font-semibold text-white bg-gray-900 rounded-lg hover:bg-black">Download</button>
+              <button onClick={() => setExpanded(false)} className="px-3 py-1.5 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50">✕ Close</button>
+            </div>
+          </div>
+          <div className="flex-1 overflow-auto">{grid}</div>
         </div>
       )}
 
