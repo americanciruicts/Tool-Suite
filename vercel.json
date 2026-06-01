@@ -6,11 +6,11 @@
   "rewrites": [
     {
       "source": "/api/:path*",
-      "destination": "https://formatting-pressing-victory-karl.trycloudflare.com/api/:path*"
+      "destination": "https://invalid-comic-functioning-terminology.trycloudflare.com/api/:path*"
     },
     {
       "source": "/health",
-      "destination": "https://formatting-pressing-victory-karl.trycloudflare.com/health"
+      "destination": "https://invalid-comic-functioning-terminology.trycloudflare.com/health"
     }
   ]
 }

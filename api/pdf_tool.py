@@ -1566,36 +1566,49 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
 
     extraction_method = table_data.get('extraction_method', 'tables')
 
-    # Hybrid accuracy (BOM mode only): when the deterministic text path is weak
-    # — low confidence or almost no rows on a dense engineering drawing — fall
-    # back to the local Ollama vision model, which reads glyphs precisely
-    # (5≠S, 0≠O) and reconstructs rows the geometry parser misses. No-op (text
-    # result kept) when the vision deps / Ollama server are unavailable.
-    if mode == "bom" and (table_data['confidence'] < 0.6 or len(df) < 2):
-        try:
-            from vision_tool import extract_bom_via_vision, vision_available
-            if vision_available():
-                vision_df = extract_bom_via_vision(pdf_path)
-                if vision_df is not None and len(vision_df) > len(df):
-                    df = vision_df
-                    extraction_method = 'ollama-vision'
-                    warnings.append(
-                        "Low-confidence text extraction — used local AI vision (Ollama) for accuracy."
-                    )
-        except Exception as e:
-            warnings.append(f"AI vision fallback unavailable: {e}")
-
     raw_df = df
     bom_df = None
 
     if mode == "bom":
-        # BOM-aware output. "Normal" raw + "BOM" (quote-template layout). BOM
-        # mapping is best-effort — on failure the BOM tab mirrors the raw table.
-        try:
-            bom_df = map_to_quote_template_schema(df)
-        except Exception as e:
-            bom_df = df
-            warnings.append(f"BOM normalization fell back to raw table: {e}")
+        # BOM-aware output. First map the text-extracted table to the BOM schema.
+        def _safe_map(d):
+            try:
+                return map_to_quote_template_schema(d)
+            except Exception:
+                return None
+
+        bom_df = _safe_map(df)
+
+        # Hybrid accuracy: the text path often *looks* like it found a table on a
+        # dense engineering drawing (it grabs the title block) yet yields no real
+        # BOM rows. The reliable failure signal is "few/zero mapped BOM rows" —
+        # not raw confidence. When that happens, fall back to the local Ollama
+        # vision model, which reads glyphs precisely (5≠S, 0≠O) and reconstructs
+        # the parts list the geometry parser misses. No-op if Ollama/deps absent.
+        text_bom_rows = 0 if bom_df is None else len(bom_df)
+        if text_bom_rows < 3 or table_data['confidence'] < 0.6:
+            try:
+                from vision_tool import extract_bom_via_vision, vision_available
+                if vision_available():
+                    vision_df = extract_bom_via_vision(pdf_path)
+                    if vision_df is not None and not vision_df.empty:
+                        vision_bom = _safe_map(vision_df)
+                        if vision_bom is not None and len(vision_bom) > text_bom_rows:
+                            raw_df = vision_df
+                            bom_df = vision_bom
+                            extraction_method = 'ollama-vision'
+                            warnings.append(
+                                "Used local AI vision (Ollama) — text extraction found no usable BOM rows."
+                            )
+                else:
+                    warnings.append("AI vision fallback unavailable (Ollama not reachable); used text extraction.")
+            except Exception as e:
+                warnings.append(f"AI vision fallback error: {e}")
+
+        if bom_df is None:
+            bom_df = raw_df
+            warnings.append("BOM normalization produced no rows; BOM tab mirrors the raw table.")
+
         preview_df = bom_df if (bom_df is not None and not bom_df.empty) else raw_df
         if out_format == "word":
             generate_word_document(
