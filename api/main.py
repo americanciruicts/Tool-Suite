@@ -2,6 +2,8 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.encoders import jsonable_encoder
+from starlette.concurrency import run_in_threadpool
+import asyncio
 import tempfile
 import os
 import json
@@ -39,6 +41,20 @@ _CACHE_TTL_S = 3600
 
 # Recent error ring buffer for /api/errors (debugging from the UI)
 _ERROR_BUFFER: deque = deque(maxlen=50)
+
+# Async PDF conversion jobs. PDF→Excel (esp. the Ollama vision fallback on dense
+# drawings) can take minutes — far longer than the edge proxy will hold a single
+# request. So the endpoint enqueues a job and the client polls for the result.
+# In-memory store; entries expire after 1 hour. Requires a single worker process
+# (see Dockerfile CMD) so all polls hit the same store.
+_JOBS: Dict[str, dict] = {}
+_JOBS_TTL_S = 3600
+
+
+def _prune_jobs():
+    now = time.time()
+    for k in [k for k, v in _JOBS.items() if now - v.get("ts", now) > _JOBS_TTL_S]:
+        _JOBS.pop(k, None)
 
 
 def _sha256_of(data: bytes) -> str:
@@ -548,6 +564,48 @@ async def compare_files(
             detail=f"Comparison failed: {str(e)}"
         )
 
+def _do_pdf_conversion(content: bytes, filename: str, mode: str, out_format: str) -> Dict:
+    """Blocking PDF→file conversion (runs in a threadpool). Writes temp files,
+    extracts, builds the preview payload, and cleans up. Raises on failure."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_pdf:
+        tmp_pdf.write(content)
+        tmp_pdf.flush()
+        pdf_path = tmp_pdf.name
+
+    base, _ = os.path.splitext(filename)
+    ext = "docx" if out_format == "word" else "xlsx"
+    output_filename = f"{base}.{ext}"
+    output_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_{output_filename}")
+    try:
+        result = extract_bom_from_pdf(pdf_path, output_path, mode, out_format)
+        return _build_convert_payload(output_path, output_filename, out_format, result)
+    finally:
+        for p in (pdf_path, output_path):
+            try:
+                if os.path.exists(p):
+                    os.unlink(p)
+            except Exception as e:
+                logger.warning(f"Failed to clean up temp file {p}: {e}")
+
+
+async def _run_pdf_job(job_id: str, content: bytes, filename: str,
+                       mode: str, out_format: str, cache_key: str):
+    """Background task: run the conversion, store the result/error under job_id."""
+    try:
+        payload = await run_in_threadpool(_do_pdf_conversion, content, filename, mode, out_format)
+        _cache_put(cache_key, payload)
+        _JOBS[job_id] = {"status": "done", "payload": payload, "ts": time.time()}
+        logger.info(f"PDF job {job_id} done: {filename} ({mode}/{out_format})")
+    except ValueError as e:
+        _record_error("pdf_validation", str(e), filename=filename)
+        _JOBS[job_id] = {"status": "error", "detail": str(e), "ts": time.time()}
+    except Exception as e:
+        import traceback
+        logger.error(f"PDF job {job_id} failed: {e}\n{traceback.format_exc()}")
+        _record_error("pdf_exception", str(e), filename=filename)
+        _JOBS[job_id] = {"status": "error", "detail": f"PDF processing failed: {e}", "ts": time.time()}
+
+
 @app.post("/api/pdf-to-excel")
 async def pdf_to_excel(
     file: UploadFile = File(...),
@@ -555,97 +613,59 @@ async def pdf_to_excel(
     output_format: str = Form("excel"),
 ):
     """
-    Convert a PDF to Excel.
+    Convert a PDF to Excel/Word — asynchronous.
 
-    Args:
-        file: PDF file
-        mode: "bom"    → BOM-aware conversion: normalize to the BOM/quote schema,
-                         AI vision fallback for dense drawings. Output has two
-                         sheets ("Normal" raw + "BOM"), with BOM shown first.
-              "normal" → generic any-PDF table extraction, raw, single sheet.
+    mode:   "bom" (normalize to BOM/quote schema + Ollama vision fallback) or
+            "normal" (generic any-PDF table, raw).
+    output_format: "excel" (.xlsx) or "word" (.docx).
 
-    Returns:
-        JSON with:
-            - success: bool
-            - excel_filename: str (name for download)
-            - excel_url: str (temporary download path)
-            - metadata: Dict with pages_processed, rows_extracted, confidence, columns_detected
-            - warnings: List[str]
+    Returns immediately with {"status": "processing", "job_id": ...}; poll
+    GET /api/pdf-to-excel/status/{job_id} for the result. A cached result is
+    returned inline as {"status": "done", ...payload}. This keeps long vision
+    conversions from exceeding the edge proxy's request timeout.
     """
-    try:
-        # Validate PDF file type
-        if not file.filename.lower().endswith('.pdf'):
-            raise HTTPException(
-                status_code=400,
-                detail="File must be PDF format"
-            )
+    if not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="File must be PDF format")
 
-        # Create temporary PDF file
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_pdf:
-            content = await file.read()
-            tmp_pdf.write(content)
-            tmp_pdf.flush()
-            pdf_path = tmp_pdf.name
+    content = await file.read()
+    mode = (mode or "bom").lower()
+    if mode not in ("bom", "normal"):
+        mode = "bom"
+    out_format = (output_format or "excel").lower()
+    if out_format not in ("excel", "word"):
+        out_format = "excel"
 
-        mode = (mode or "bom").lower()
-        if mode not in ("bom", "normal"):
-            mode = "bom"
-        out_format = (output_format or "excel").lower()
-        if out_format not in ("excel", "word"):
-            out_format = "excel"
+    cache_key = f"pdf:{mode}:{out_format}:{_sha256_of(content)}"
+    cached = _cache_get(cache_key)
+    if cached:
+        logger.info(f"Cache hit for PDF {file.filename} ({mode}/{out_format})")
+        return JSONResponse(content={"status": "done", **cached})
 
-        # Cache lookup — keyed on bytes + mode + format
-        cache_key = f"pdf:{mode}:{out_format}:{_sha256_of(content)}"
-        cached = _cache_get(cache_key)
-        if cached:
-            logger.info(f"Cache hit for PDF {file.filename} ({mode}/{out_format})")
-            return JSONResponse(content=cached)
+    _prune_jobs()
+    job_id = uuid.uuid4().hex
+    _JOBS[job_id] = {"status": "processing", "ts": time.time()}
+    logger.info(f"Queued PDF job {job_id}: {file.filename} (mode={mode}, format={out_format})")
+    asyncio.create_task(_run_pdf_job(job_id, content, file.filename, mode, out_format, cache_key))
+    return JSONResponse(content={"status": "processing", "job_id": job_id}, status_code=202)
 
-        try:
-            # Output filename — preserve the user's name, swap the extension to
-            # match the chosen format.
-            base, _ = os.path.splitext(file.filename)
-            ext = "docx" if out_format == "word" else "xlsx"
-            output_filename = f"{base}.{ext}"
-            output_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_{output_filename}")
 
-            logger.info(f"Processing PDF: {file.filename} (mode={mode}, format={out_format})")
-            result = extract_bom_from_pdf(pdf_path, output_path, mode=mode, out_format=out_format)
+@app.get("/api/pdf-to-excel/status/{job_id}")
+async def pdf_to_excel_status(job_id: str):
+    """Poll a PDF conversion job. Returns {"status": "processing"} |
+    {"status": "error", "detail": ...} | {"status": "done", ...payload}."""
+    job = _JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Unknown or expired job id")
+    if job["status"] == "processing":
+        return JSONResponse(content={"status": "processing"})
+    if job["status"] == "error":
+        return JSONResponse(content={"status": "error", "detail": job.get("detail", "conversion failed")})
+    return JSONResponse(content={"status": "done", **job["payload"]})
 
-            logger.info(f"Extracted {result['metadata']['rows_extracted']} rows from PDF")
 
-            payload = _build_convert_payload(output_path, output_filename, out_format, result)
-            _cache_put(cache_key, payload)
-            return JSONResponse(content=payload)
-
-        finally:
-            # Clean up temporary files
-            try:
-                if os.path.exists(pdf_path):
-                    os.unlink(pdf_path)
-                if os.path.exists(output_path):
-                    os.unlink(output_path)
-            except Exception as e:
-                logger.warning(f"Failed to clean up temporary files: {e}")
-
-    except ValueError as e:
-        # Expected errors (validation, table detection, etc.)
-        logger.error(f"PDF processing validation error: {str(e)}")
-        _record_error("pdf_validation", str(e), filename=getattr(file, "filename", None))
-        raise HTTPException(
-            status_code=400,
-            detail=str(e)
-        )
-    except Exception as e:
-        # Unexpected errors
-        import traceback
-        logger.error(f"Error during PDF processing: {str(e)}")
-        logger.error(f"Full traceback: {traceback.format_exc()}")
-        _record_error("pdf_exception", str(e), filename=getattr(file, "filename", None))
-        raise HTTPException(
-            status_code=500,
-            detail=f"PDF processing failed: {str(e)}"
-        )
+@app.options("/api/pdf-to-excel/status/{job_id}")
+async def pdf_to_excel_status_options(job_id: str):
+    return {"message": "CORS preflight handled"}
 
 @app.options("/api/pdf-to-excel")
 async def pdf_to_excel_options():
@@ -682,7 +702,7 @@ async def image_to_excel(file: UploadFile = File(...)):
         output_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}_{output_filename}")
 
         logger.info(f"Processing image: {file.filename}")
-        result = extract_bom_from_image(pdf_path, output_path)
+        result = await run_in_threadpool(extract_bom_from_image, pdf_path, output_path)
         logger.info(f"Extracted {result['metadata']['rows_extracted']} BOM items from image")
 
         payload = _build_preview_payload(output_path, output_filename, result)

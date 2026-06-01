@@ -703,14 +703,38 @@ export default function Home() {
       formData.append('mode', pdfMode);
       formData.append('output_format', pdfFormat);
       const apiUrl = `${getApiBasePath()}/pdf-to-excel`;
-      const response = await axios.post<ConvertPreview>(apiUrl, formData, {
-        headers: {
-          'Content-Type': 'multipart/form-data',
-          'ngrok-skip-browser-warning': 'true',
-        },
+      const headers = { 'ngrok-skip-browser-warning': 'true' };
+
+      // Conversion runs as an async job (BOM vision can take minutes — longer
+      // than the edge proxy will hold one request). Enqueue, then poll.
+      const start = await axios.post<any>(apiUrl, formData, {
+        headers: { 'Content-Type': 'multipart/form-data', ...headers },
       });
-      setPdfPreview(response.data);
-      if (pdfFile) pushRecent({ kind: 'pdf', label: pdfFile.name });
+
+      const finish = (data: ConvertPreview) => {
+        setPdfPreview(data);
+        if (pdfFile) pushRecent({ kind: 'pdf', label: pdfFile.name });
+      };
+
+      if (start.data?.status === 'done') {
+        finish(start.data as ConvertPreview);
+        return;
+      }
+      const jobId = start.data?.job_id;
+      if (!jobId) throw new Error('Server did not return a job id.');
+
+      // Poll up to ~20 minutes (large drawings via AI vision are slow).
+      const statusUrl = `${apiUrl}/status/${jobId}`;
+      const deadline = Date.now() + 20 * 60 * 1000;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 2500));
+        const s = await axios.get<any>(statusUrl, { headers });
+        const st = s.data?.status;
+        if (st === 'done') { finish(s.data as ConvertPreview); return; }
+        if (st === 'error') { throw new Error(s.data?.detail || 'Conversion failed.'); }
+        // else 'processing' — keep polling
+      }
+      throw new Error('Conversion timed out. Try Normal mode or a smaller PDF.');
     } catch (err: any) {
       console.error('PDF processing error:', err);
       const detail = err?.response?.data?.detail;
@@ -2041,6 +2065,12 @@ export default function Home() {
                   Try a sample
                 </button>
               </div>
+
+              {pdfProcessing && pdfMode === 'bom' && (
+                <div className="mx-4 mb-4 p-3 bg-blue-50 border border-blue-200 rounded-lg text-sm text-blue-700">
+                  Working… BOM extraction can take a few minutes for large engineering drawings (AI vision runs locally). You can leave this tab open.
+                </div>
+              )}
 
               {pdfError && (
                 <div className="mx-4 mb-4 p-4 bg-red-50 border border-red-200 rounded-lg">

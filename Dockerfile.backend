@@ -31,4 +31,7 @@ USER appuser
 
 EXPOSE 8000
 
+# Single worker: PDF conversions run as async background jobs tracked in an
+# in-memory store, so all status polls must hit the same process. Long jobs run
+# in a threadpool, keeping the event loop responsive to /health and status polls.
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
