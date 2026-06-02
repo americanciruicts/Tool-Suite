@@ -1492,6 +1492,35 @@ def generate_word_document(frames: List, output_path: str,
 # type) is left blank because it cannot be inferred from a BOM PDF.
 QUOTE_TEMPLATE_COLUMNS = ["Item#", "Description", "Mfg", "Mfg P/N", "Qty", "SMT/TH", "Loc"]
 
+# Package/footprint hints for inferring assembly type (SMT vs through-hole).
+_TH_HINTS = ("THRU", "THROUGH", "PTH", "DIP", "PDIP", "RADIAL", "AXIAL",
+             "TO-220", "TO220", "TO-92", "TO92", "TO-247", "TO-218")
+_SMT_HINTS = ("SURFACE MNT", "SURFACE MOUNT", "SMD", "SMT", "0201", "0402", "0603", "0805", "1206", "1210",
+              "1806", "2010", "2512", "SOT23", "SOT-23", "SOT", "SOIC", "SO-8",
+              "SO8", "TSSOP", "SSOP", "MSOP", "TSOP", "QFN", "QFP", "TQFP",
+              "LQFP", "BGA", "WSON", "DFN", "SC70", "SC-70", "LGA", "PLCC",
+              "MELF", "TUMD", "GS08", "PPAK", "WLCSP", "DPAK", "D2PAK",
+              "TO-252", "TO-263", "CHIPLED", "WSON", "0603")
+
+
+# Non-placed items (the bare board and process materials) have no SMT/TH.
+_NON_PLACED = ("PWB", "PCB", "BARE BOARD", "EPOXY", "ADHESIVE", "SOLDER",
+               "CONFORMAL", "COATING", "COMPOUND", "INK", "LABEL", "STENCIL", "STAKING")
+
+
+def _infer_smt_th(text: str) -> str:
+    """Infer 'SMT' or 'TH' for a part. Bare board / materials → '' (N/A);
+    explicit through-hole packages → 'TH'; otherwise default to 'SMT' (placed
+    components and connectors on an SMT assembly), which the quoter can adjust."""
+    u = (text or "").upper()
+    if any(k in u for k in _NON_PLACED):
+        return ""
+    if any(h in u for h in _TH_HINTS):
+        return "TH"
+    if any(h in u for h in _SMT_HINTS):
+        return "SMT"
+    return "SMT"
+
 
 # Engineering-drawing header phrases the general classifier doesn't know.
 # MIL-STD-100 / ASME Y14.34 parts lists label the part-number column
@@ -1569,7 +1598,12 @@ def map_to_quote_template_schema(df: pd.DataFrame) -> pd.DataFrame:
     out["Mfg"] = df[chosen["manufacturer"]].astype(str) if "manufacturer" in chosen else ""
     out["Mfg P/N"] = df[chosen["mpn"]].astype(str) if "mpn" in chosen else ""
     out["Qty"] = df[chosen["qty"]].astype(str) if "qty" in chosen else ""
-    out["SMT/TH"] = ""
+    # SMT/TH isn't an explicit column on the drawing — infer it from each part's
+    # package/footprint in the description + part number.
+    mpn_series = df[chosen["mpn"]].astype(str) if "mpn" in chosen else pd.Series([""] * len(out))
+    out["SMT/TH"] = [
+        _infer_smt_th(f"{d} {p}") for d, p in zip(out["Description"], list(mpn_series))
+    ]
     out["Loc"] = df[chosen["refdes"]].astype(str) if "refdes" in chosen else ""
 
     # Keep only real line items: must have a part number or a description.
