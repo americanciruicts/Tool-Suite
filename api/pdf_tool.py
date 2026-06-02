@@ -1486,6 +1486,122 @@ def generate_word_document(frames: List, output_path: str,
     return output_path
 
 
+def _docx_shade(cell, fill_hex: str):
+    """Set a cell's background fill (mimics the template header shading)."""
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    tcPr = cell._tc.get_or_add_tcPr()
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:fill"), fill_hex)
+    tcPr.append(shd)
+
+
+def generate_word_bom_document(bom_df: pd.DataFrame, raw_df: pd.DataFrame, output_path: str,
+                               images: Optional[List[bytes]] = None) -> str:
+    """
+    Word output styled to match BOM QUOTE TEMPLATE.xlsx: a "BOM QUOTE" title, a
+    summary block (Total / SMT / Through-Hole / Fine-Pitch counts computed from
+    the data), and the 7-column line-item table with the template's column widths
+    and a shaded, bold header. Adds the raw extraction + drawing image after.
+    """
+    from docx import Document
+    from docx.shared import Pt, Inches, RGBColor
+    from docx.enum.section import WD_ORIENT
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    cols = QUOTE_TEMPLATE_COLUMNS  # Item# | Description | Mfg | Mfg P/N | Qty | SMT/TH | Loc
+    widths = [0.5, 3.4, 1.5, 1.6, 0.7, 0.85, 1.0]  # inches, proportional to the template
+
+    def _int(v):
+        try:
+            return int(float(str(v).strip()))
+        except Exception:
+            return 0
+
+    qty = list(bom_df["Qty"]) if "Qty" in bom_df.columns else []
+    smt = list(bom_df["SMT/TH"]) if "SMT/TH" in bom_df.columns else [""] * len(bom_df)
+    desc = list(bom_df["Description"]) if "Description" in bom_df.columns else [""] * len(bom_df)
+    total_comp = sum(_int(q) for q in qty)
+    smt_comp = sum(_int(q) for q, s in zip(qty, smt) if str(s).upper() in ("SMT", "SMD"))
+    th_comp = sum(_int(q) for q, s in zip(qty, smt) if str(s).upper() == "TH")
+    fp_comp = sum(_int(q) for q, d in zip(qty, desc)
+                  if any(k in str(d).upper() for k in ("QFN", "BGA", "QFP", "FINE PITCH")))
+
+    doc = Document()
+    sec = doc.sections[0]
+    sec.orientation = WD_ORIENT.LANDSCAPE
+    sec.page_width, sec.page_height = sec.page_height, sec.page_width
+    for m in ("left_margin", "right_margin", "top_margin", "bottom_margin"):
+        setattr(sec, m, Inches(0.5))
+
+    title = doc.add_paragraph()
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = title.add_run("BOM QUOTE")
+    run.bold = True
+    run.font.size = Pt(18)
+
+    # Summary block
+    summ = doc.add_table(rows=0, cols=2)
+    for label, val in (("Total Components", total_comp), ("Lines", len(bom_df)),
+                       ("SMT", smt_comp), ("Through Hole", th_comp), ("Fine Pitch/QFP/QFN/BGA", fp_comp)):
+        r = summ.add_row().cells
+        r[0].text = label
+        r[1].text = str(val)
+        for p in r[0].paragraphs:
+            for rn in p.runs:
+                rn.bold = True
+    doc.add_paragraph("")
+
+    # Line-item table
+    table = doc.add_table(rows=1, cols=len(cols))
+    table.style = "Table Grid"
+    table.autofit = False
+    hdr = table.rows[0].cells
+    for i, c in enumerate(cols):
+        hdr[i].text = c
+        _docx_shade(hdr[i], "D9E1F2")  # light blue, like a quote header
+        for p in hdr[i].paragraphs:
+            for rn in p.runs:
+                rn.bold = True
+    for _, row in bom_df.iterrows():
+        cells = table.add_row().cells
+        for i, c in enumerate(cols):
+            v = row[c] if c in bom_df.columns else ""
+            cells[i].text = "" if pd.isna(v) else str(v)
+    # Apply column widths to every cell (python-docx needs per-cell width).
+    for r in table.rows:
+        for i, w in enumerate(widths):
+            r.cells[i].width = Inches(w)
+
+    # Raw extraction
+    doc.add_paragraph("")
+    doc.add_heading("Normal (raw extraction)", level=2)
+    if raw_df is not None and len(raw_df) > 0:
+        rt = doc.add_table(rows=1, cols=len(raw_df.columns))
+        rt.style = "Table Grid"
+        for i, c in enumerate(raw_df.columns):
+            rt.rows[0].cells[i].text = str(c)
+            for p in rt.rows[0].cells[i].paragraphs:
+                for rn in p.runs:
+                    rn.bold = True
+        for _, row in raw_df.iterrows():
+            cells = rt.add_row().cells
+            for i, val in enumerate(row):
+                cells[i].text = "" if pd.isna(val) else str(val)
+
+    if images:
+        doc.add_heading("Drawing", level=2)
+        for png in images:
+            try:
+                doc.add_picture(io.BytesIO(png), width=Inches(9.5))
+            except Exception:
+                continue
+
+    doc.save(output_path)
+    return output_path
+
+
 # Column layout used on the "BOM" tab — mirrors the line-item header (row 23)
 # of BOM QUOTE TEMPLATE.xlsx so the result pastes straight into the stakeholder
 # quoting workbook. "Loc" carries reference designators; "SMT/TH" (assembly
@@ -1836,9 +1952,8 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
         images = render_drawing_images(pdf_path)
         _p(94, "Writing file")
         if out_format == "word":
-            generate_word_document(
-                [("BOM", bom_df), ("Normal (raw extraction)", raw_df)], output_excel_path, images=images)
-            sheets = ["BOM", "Normal (raw extraction)", "Drawing"]
+            generate_word_bom_document(bom_df, raw_df, output_excel_path, images=images)
+            sheets = ["BOM (quote)", "Normal (raw)", "Drawing"]
         else:
             # Fill the stakeholder quote template; fall back to the plain
             # two-tab workbook if the template can't be loaded.
