@@ -155,7 +155,9 @@ def parse_bom_coords(pdf_path: str, max_pages: int = 8) -> Optional[pd.DataFrame
                     if not (lo <= w["top"] <= t["top"]):
                         continue
                     col = colof(w)
-                    if col in ("refdes", "desc", "mfr"):
+                    # Assign part-number by nearest row too — on the two-table
+                    # layout a row's part number can sit a hair off the item line.
+                    if col in ("refdes", "desc", "mfr", "partno"):
                         i = min(range(len(atops)), key=lambda k: abs(atops[k] - w["top"]))
                         cells[i][col].append(w)
 
@@ -167,11 +169,16 @@ def parse_bom_coords(pdf_path: str, max_pages: int = 8) -> Optional[pd.DataFrame
                     mfr = " ".join(x for x in txt("mfr")
                                    if x.upper() not in _CATEGORIES and not x.isdigit()
                                    and len(x) > 1 and x.upper() not in _STOP)
-                    if a["partno"] or desc:
+                    # Part number: drop bare SMT/layer digits and header words.
+                    partno = " ".join(x for x in txt("partno")
+                                      if x.upper() not in _STOP and not (x.isdigit() and len(x) <= 2))
+                    if not partno:
+                        partno = a["partno"]
+                    if partno or desc:
                         out.append({
                             "Item No.": a["item"], "Reference Designation": refdes,
                             "Qty": a["qty"], "CAGE/Code Ident": a["cage"],
-                            "Part Number": a["partno"], "Description": desc, "Manufacturer": mfr,
+                            "Part Number": partno, "Description": desc, "Manufacturer": mfr,
                         })
 
     if len(out) < 2:
