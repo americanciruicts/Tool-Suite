@@ -432,10 +432,10 @@ export default function Home() {
   const [analyzing, setAnalyzing] = useState(false);
 
   // Tab state — synced to URL hash so refresh + share-link land on the same tool.
-  const [activeTab, setActiveTab] = useState<'pdf' | 'image' | 'compare'>(() => {
+  const [activeTab, setActiveTab] = useState<Tab>(() => {
     if (typeof window === 'undefined') return 'pdf';
     const h = (window.location.hash || '').replace('#', '');
-    return (['pdf', 'image', 'compare'] as const).includes(h as any) ? (h as any) : 'pdf';
+    return (['pdf', 'image', 'compare', 'recent'] as const).includes(h as any) ? (h as any) : 'pdf';
   });
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -445,7 +445,7 @@ export default function Home() {
   useEffect(() => {
     const onHash = () => {
       const h = (window.location.hash || '').replace('#', '');
-      if ((['pdf', 'image', 'compare'] as const).includes(h as any) && h !== activeTab) {
+      if ((['pdf', 'image', 'compare', 'recent'] as const).includes(h as any) && h !== activeTab) {
         setActiveTab(h as any);
       }
     };
@@ -2028,6 +2028,14 @@ export default function Home() {
       )}
 
       {/* ===== TAB 1: PDF to Excel Converter ===== */}
+      {activeTab === 'recent' && (
+        <RecentActivity onOpen={(it) => {
+          if (it.kind === 'compare') { setActiveTab('compare'); }
+          else if (it.kind === 'pdf' && it.preview) { setActiveTab('pdf'); setPdfPreview(it.preview); }
+          else if (it.kind === 'image' && it.preview) { setActiveTab('image'); setImagePreview(it.preview); }
+        }} />
+      )}
+
       {activeTab === 'pdf' && (
         <div className="print:hidden">
           <div className="max-w-3xl mx-auto">
@@ -2878,7 +2886,7 @@ export default function Home() {
 // App shell, navigation, theme toggle, processing overlay
 // ─────────────────────────────────────────────────────────────────────
 
-type Tab = 'pdf' | 'image' | 'compare';
+type Tab = 'pdf' | 'image' | 'compare' | 'recent';
 
 function AppShell({
   children,
@@ -2938,6 +2946,16 @@ function AppShell({
       label: 'BOM Comparison',
       description: 'Diff two Excel BOMs',
       icon: <ArrowLeftRight className="w-5 h-5" strokeWidth={1.8} />,
+    },
+    {
+      key: 'recent',
+      label: 'Recent Activity',
+      description: 'Reopen & re-download past conversions',
+      icon: (
+        <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+        </svg>
+      ),
     },
   ];
 
@@ -3104,6 +3122,7 @@ function SectionHeader({ activeTab }: { activeTab: Tab }) {
     pdf:     { title: 'PDF to BOM',     sub: 'Drop an engineering PDF — we extract the Bill of Materials into the quote-template format (Excel or Word).', pill: 'BOM extraction' },
     image:   { title: 'Image to Excel',   sub: 'OCR a JPG or PNG of any table. Paste with ⌘V/Ctrl+V or drop a file.', pill: 'Tesseract + smart whitelisting' },
     compare: { title: 'BOM Comparison',   sub: 'Diff two Excel BOMs. Fuzzy matching catches renamed MPNs across revisions.', pill: 'Fuzzy MPN matching' },
+    recent:  { title: 'Recent Activity',  sub: 'Your recent conversions (saved in this browser). Reopen a preview or re-download anytime.', pill: 'Saved locally' },
   };
   const m = meta[activeTab];
   return (
@@ -3228,6 +3247,90 @@ function pushRecent(item: Omit<RecentItem, 'ts'>) {
     }
     window.dispatchEvent(new Event('toolsuite-recents-updated'));
   } catch {}
+}
+
+function _writeRecents(arr: RecentItem[]) {
+  try {
+    localStorage.setItem(RECENTS_KEY, JSON.stringify(arr));
+    window.dispatchEvent(new Event('toolsuite-recents-updated'));
+  } catch {}
+}
+
+function _timeAgo(ts: number): string {
+  const s = Math.max(1, Math.floor((Date.now() - ts) / 1000));
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60); if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60); if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24); return `${d}d ago`;
+}
+
+function RecentActivity({ onOpen }: { onOpen: (it: RecentItem) => void }) {
+  const [items, setItems] = useState<RecentItem[]>([]);
+  useEffect(() => {
+    const load = () => {
+      try { const raw = localStorage.getItem(RECENTS_KEY); setItems(raw ? JSON.parse(raw) : []); } catch {}
+    };
+    load();
+    window.addEventListener('toolsuite-recents-updated', load);
+    return () => window.removeEventListener('toolsuite-recents-updated', load);
+  }, []);
+
+  const kindLabel = (k: RecentItem['kind']) => k === 'pdf' ? 'PDF → BOM' : k === 'image' ? 'Image → Excel' : 'BOM Comparison';
+  const fmtTag = (it: RecentItem) => it.preview ? (/\.docx$/i.test(it.preview.filename || '') ? 'DOCX' : 'XLSX') : '';
+
+  const download = (it: RecentItem) => {
+    const p = it.preview; if (!p?.excel_base64) return;
+    try {
+      const bin = atob(p.excel_base64); const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const blob = new Blob([bytes], { type: p.mime || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = p.filename || 'download';
+      document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+    } catch {}
+  };
+  const remove = (ts: number) => _writeRecents(items.filter(i => i.ts !== ts));
+  const clearAll = () => _writeRecents([]);
+
+  return (
+    <div className="print:hidden max-w-4xl mx-auto">
+      <div className="flex items-center justify-between mb-4">
+        <p className="text-sm text-gray-500">{items.length} recent conversion{items.length === 1 ? '' : 's'} (saved in this browser)</p>
+        {items.length > 0 && (
+          <button onClick={clearAll} className="px-3 py-1.5 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50">Clear all</button>
+        )}
+      </div>
+      {items.length === 0 ? (
+        <div className="card p-10 text-center text-gray-500">
+          No recent conversions yet. Convert a PDF or image and it'll show up here — reopen the preview or re-download anytime.
+        </div>
+      ) : (
+        <div className="card divide-y divide-gray-100">
+          {items.map(it => (
+            <div key={it.ts} className="flex items-center gap-3 px-4 py-3">
+              <span className="text-xl leading-none">{it.kind === 'pdf' ? '📄' : it.kind === 'image' ? '🖼' : '⇄'}</span>
+              <div className="flex-1 min-w-0">
+                <p className="font-medium text-gray-900 truncate">{it.label}</p>
+                <p className="text-xs text-gray-500">{kindLabel(it.kind)} · {_timeAgo(it.ts)}{fmtTag(it) ? ` · ${fmtTag(it)}` : ''}</p>
+              </div>
+              {it.preview && (
+                <button onClick={() => onOpen(it)} className="px-3 py-1.5 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50">Open</button>
+              )}
+              {it.preview?.excel_base64 && (
+                <button onClick={() => download(it)} className="px-3 py-1.5 text-sm font-semibold text-white bg-gray-900 rounded-lg hover:bg-black">Download</button>
+              )}
+              {it.kind === 'compare' && (
+                <button onClick={() => onOpen(it)} className="px-3 py-1.5 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50">Open</button>
+              )}
+              <button onClick={() => remove(it.ts)} title="Remove" className="p-1.5 text-gray-400 hover:text-red-500">
+                <XCircle className="w-5 h-5" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ────────────────────────────────────────────────────────────────────
