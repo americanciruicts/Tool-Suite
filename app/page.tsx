@@ -2,7 +2,7 @@
 
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { useDropzone } from 'react-dropzone';
-import { Upload, FileSpreadsheet, ArrowLeftRight, CheckCircle, XCircle, AlertCircle, HelpCircle, ChevronDown, ChevronUp, Search, Printer, FileDown } from 'lucide-react';
+import { Upload, FileSpreadsheet, FileText, ArrowLeftRight, CheckCircle, XCircle, AlertCircle, HelpCircle, ChevronDown, ChevronUp, Search, Printer, FileDown } from 'lucide-react';
 import axios from 'axios';
 // Removed unused import
 
@@ -85,6 +85,8 @@ type ConvertPreviewPanelProps = {
     rows: string[][];
     total_rows: number;
     preview_truncated: boolean;
+    excel_base64?: string;
+    mime?: string;
     metadata?: {
       confidence?: number;
       rows_extracted?: number;
@@ -298,9 +300,14 @@ function ConvertPreviewPanel({ accentColor, preview, onDownload, onReset, onGoCo
 
       {/* File row */}
       <div className="px-6 py-3 border-t border-gray-100 flex flex-wrap items-center gap-3">
-        <div className="w-10 h-10 rounded-lg bg-green-600 flex items-center justify-center shadow-sm">
-          <span className="text-white text-[10px] font-bold tracking-wide">XLSX</span>
-        </div>
+        {(() => {
+          const isWord = /\.docx$/i.test(preview.filename) || (preview.mime || '').includes('word');
+          return (
+            <div className={`w-10 h-10 rounded-lg flex items-center justify-center shadow-sm ${isWord ? 'bg-blue-700' : 'bg-green-600'}`}>
+              <span className="text-white text-[10px] font-bold tracking-wide">{isWord ? 'DOCX' : 'XLSX'}</span>
+            </div>
+          );
+        })()}
         <p className="font-medium text-gray-900 flex-1 min-w-[120px] truncate">{preview.filename}</p>
         <ConfidenceBadge
           value={preview.metadata?.confidence}
@@ -801,7 +808,7 @@ export default function Home() {
 
       const finish = (data: ConvertPreview) => {
         setPdfPreview(data);
-        if (pdfFile) pushRecent({ kind: 'pdf', label: pdfFile.name });
+        if (pdfFile) pushRecent({ kind: 'pdf', label: pdfFile.name, preview: data });
       };
 
       if (start.data?.status === 'done') {
@@ -853,7 +860,7 @@ export default function Home() {
         },
       });
       setImagePreview(response.data);
-      if (imageFile) pushRecent({ kind: 'image', label: imageFile.name });
+      if (imageFile) pushRecent({ kind: 'image', label: imageFile.name, preview: response.data });
     } catch (err: any) {
       console.error('Image processing error:', err);
       const detail = err?.response?.data?.detail;
@@ -1956,6 +1963,12 @@ export default function Home() {
       setActiveTab={setActiveTab}
       onOpenSettings={() => setSettingsOpen(true)}
       onOpenHelp={() => setHelpOpen(true)}
+      onOpenRecent={(it) => {
+        if (it.kind === 'compare') { setActiveTab('compare'); }
+        else if (it.kind === 'pdf' && it.preview) { setActiveTab('pdf'); setPdfPreview(it.preview); }
+        else if (it.kind === 'image' && it.preview) { setActiveTab('image'); setImagePreview(it.preview); }
+        else { setActiveTab(it.kind === 'image' ? 'image' : 'pdf'); }
+      }}
     >
       {/* Section header — replaces the giant gradient hero with a tight,
           context-aware title that reflects which tool is active. */}
@@ -2063,8 +2076,10 @@ export default function Home() {
                   <svg className="w-6 h-6 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 8l4 4m0 0l-4 4m4-4H3" />
                   </svg>
-                  <div className="w-14 h-14 rounded-xl bg-green-100 flex items-center justify-center">
-                    <FileSpreadsheet className="w-8 h-8 text-green-600" />
+                  <div className={`w-14 h-14 rounded-xl flex items-center justify-center ${pdfFormat === 'word' ? 'bg-blue-100' : 'bg-green-100'}`}>
+                    {pdfFormat === 'word'
+                      ? <FileText className="w-8 h-8 text-blue-700" />
+                      : <FileSpreadsheet className="w-8 h-8 text-green-600" />}
                   </div>
                 </div>
                 <p className="text-xl font-semibold text-gray-800 mb-1">
@@ -2871,12 +2886,14 @@ function AppShell({
   setActiveTab,
   onOpenSettings,
   onOpenHelp,
+  onOpenRecent,
 }: {
   children: React.ReactNode;
   activeTab: Tab;
   setActiveTab: (t: Tab) => void;
   onOpenSettings?: () => void;
   onOpenHelp?: () => void;
+  onOpenRecent?: (it: RecentItem) => void;
 }) {
   const [theme, setTheme] = useState<'light' | 'dark'>('light');
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
@@ -2958,7 +2975,10 @@ function AppShell({
           </nav>
         </div>
 
-        <RecentConversions onOpenCompare={() => setActiveTab('compare')} />
+        <RecentConversions onOpen={(it) => {
+          if (onOpenRecent) onOpenRecent(it);
+          else setActiveTab(it.kind);
+        }} />
 
         {/* Secondary actions: settings + help */}
         <div className="px-3 mt-3 flex flex-col gap-1">
@@ -3137,28 +3157,29 @@ function ProcessingOverlay({ phase }: { phase: 'pdf' | 'image' | 'compare' }) {
   );
 }
 
-type RecentItem = { ts: number; kind: 'pdf' | 'image' | 'compare'; label: string };
+type RecentItem = { ts: number; kind: 'pdf' | 'image' | 'compare'; label: string; preview?: any };
 
-function RecentConversions({ onOpenCompare }: { onOpenCompare: () => void }) {
+const RECENTS_KEY = 'toolsuite.recents.v2';
+
+function RecentConversions({ onOpen }: { onOpen: (it: RecentItem) => void }) {
   const [items, setItems] = useState<RecentItem[]>([]);
   useEffect(() => {
-    try {
-      const raw = sessionStorage.getItem('toolsuite.recents');
-      if (raw) setItems(JSON.parse(raw).slice(0, 5));
-    } catch {}
-    const onChange = () => {
+    const load = () => {
       try {
-        const raw = sessionStorage.getItem('toolsuite.recents');
-        setItems(raw ? JSON.parse(raw).slice(0, 5) : []);
+        const raw = localStorage.getItem(RECENTS_KEY);
+        setItems(raw ? JSON.parse(raw).slice(0, 8) : []);
       } catch {}
     };
-    window.addEventListener('toolsuite-recents-updated', onChange);
-    return () => window.removeEventListener('toolsuite-recents-updated', onChange);
+    load();
+    window.addEventListener('toolsuite-recents-updated', load);
+    return () => window.removeEventListener('toolsuite-recents-updated', load);
   }, []);
 
   if (!items.length) return null;
   const iconFor = (k: RecentItem['kind']) =>
     k === 'pdf' ? '📄' : k === 'image' ? '🖼' : '⇄';
+  const fmtTag = (it: RecentItem) =>
+    it.preview ? (/\.docx$/i.test(it.preview.filename || '') ? 'DOCX' : 'XLSX') : '';
 
   return (
     <div className="px-3 mt-2">
@@ -3166,10 +3187,15 @@ function RecentConversions({ onOpenCompare }: { onOpenCompare: () => void }) {
       <ul className="flex flex-col gap-0.5">
         {items.map(it => (
           <li key={it.ts}>
-            <div className="flex items-center gap-2 px-2 py-1.5 rounded-md text-xs text-app-muted hover:bg-[var(--surface-subtle)] transition-colors truncate" title={it.label}>
+            <button
+              onClick={() => onOpen(it)}
+              className="w-full text-left flex items-center gap-2 px-2 py-1.5 rounded-md text-xs text-app-muted hover:bg-[var(--surface-subtle)] transition-colors"
+              title={it.kind === 'compare' ? it.label : 'Reopen preview'}
+            >
               <span className="text-base leading-none">{iconFor(it.kind)}</span>
               <span className="truncate flex-1">{it.label}</span>
-            </div>
+              {fmtTag(it) && <span className="text-[9px] font-semibold text-gray-400 border border-gray-300 rounded px-1">{fmtTag(it)}</span>}
+            </button>
           </li>
         ))}
       </ul>
@@ -3179,10 +3205,27 @@ function RecentConversions({ onOpenCompare }: { onOpenCompare: () => void }) {
 
 function pushRecent(item: Omit<RecentItem, 'ts'>) {
   try {
-    const raw = sessionStorage.getItem('toolsuite.recents');
+    const raw = localStorage.getItem(RECENTS_KEY);
     const prev: RecentItem[] = raw ? JSON.parse(raw) : [];
-    const next: RecentItem[] = [{ ...item, ts: Date.now() }, ...prev].slice(0, 10);
-    sessionStorage.setItem('toolsuite.recents', JSON.stringify(next));
+    // De-dupe same file+kind so re-converting updates the existing entry.
+    const filtered = prev.filter(p => !(p.kind === item.kind && p.label === item.label));
+    let next: RecentItem[] = [{ ...item, ts: Date.now() }, ...filtered].slice(0, 8);
+    const save = (arr: RecentItem[]) => localStorage.setItem(RECENTS_KEY, JSON.stringify(arr));
+    try {
+      save(next);
+    } catch {
+      // Quota exceeded — previews carry base64 files. Keep previews only on the
+      // newest few, strip the rest; if still too big, drop oldest entries.
+      let ok = false;
+      for (let keep = 3; keep >= 0 && !ok; keep--) {
+        const trimmed = next.map((p, i) => (i < keep ? p : { ...p, preview: undefined }));
+        try { save(trimmed); next = trimmed; ok = true; } catch {}
+      }
+      while (!ok && next.length > 1) {
+        next = next.slice(0, next.length - 1);
+        try { save(next); ok = true; } catch {}
+      }
+    }
     window.dispatchEvent(new Event('toolsuite-recents-updated'));
   } catch {}
 }
