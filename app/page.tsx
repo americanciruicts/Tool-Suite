@@ -618,7 +618,7 @@ export default function Home() {
   const [pdfPreview, setPdfPreview] = useState<ConvertPreview | null>(null);
   // Conversion mode: 'bom' = BOM-aware (normalize columns, AI fallback);
   // 'normal' = generic any-PDF table extraction. And the output file format.
-  const [pdfMode, setPdfMode] = useState<'bom' | 'normal'>('bom');
+  const [pdfMode] = useState<'bom' | 'normal'>('bom'); // BOM-focused tool
   const [pdfFormat, setPdfFormat] = useState<'excel' | 'word'>('excel');
   const [pdfProgress, setPdfProgress] = useState(0);
   const [pdfStage, setPdfStage] = useState('');
@@ -2019,29 +2019,11 @@ export default function Home() {
         <div className="print:hidden">
           <div className="max-w-3xl mx-auto">
 
-            {/* Conversion mode + output format selectors */}
-            <div className="mb-5 flex flex-col sm:flex-row gap-4 sm:items-center sm:justify-between">
-              <div>
-                <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Conversion</p>
-                <div className="inline-flex rounded-lg border border-gray-300 bg-white p-0.5">
-                  {([
-                    ['bom', 'BOM Conversion', 'Detect & normalize the BOM (AI-assisted)'],
-                    ['normal', 'Normal PDF → Excel', 'Extract any PDF table as-is'],
-                  ] as const).map(([id, label, hint]) => (
-                    <button
-                      key={id}
-                      type="button"
-                      title={hint}
-                      onClick={() => { setPdfMode(id); setPdfPreview(null); }}
-                      className={`px-4 py-2 text-sm font-medium rounded-md transition-colors ${
-                        pdfMode === id ? 'bg-blue-600 text-white shadow-sm' : 'text-gray-600 hover:bg-gray-100'
-                      }`}
-                    >
-                      {label}
-                    </button>
-                  ))}
-                </div>
-              </div>
+            {/* Output format selector — this tool is BOM-focused (PDF → BOM). */}
+            <div className="mb-5 flex flex-col sm:flex-row gap-2 sm:items-center sm:justify-between">
+              <p className="text-sm text-gray-600">
+                Extracts the Bill of Materials and maps it to the quote-template columns.
+              </p>
               <div>
                 <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Output format</p>
                 <div className="inline-flex rounded-lg border border-gray-300 bg-white p-0.5">
@@ -2916,8 +2898,8 @@ function AppShell({
   const navItems: { key: Tab; label: string; description: string; icon: React.ReactNode }[] = [
     {
       key: 'pdf',
-      label: 'PDF to Excel',
-      description: 'Extract tables from PDFs',
+      label: 'PDF to BOM',
+      description: 'Extract BOM → Excel / Word',
       icon: (
         <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
@@ -3099,7 +3081,7 @@ function AppShell({
 
 function SectionHeader({ activeTab }: { activeTab: Tab }) {
   const meta: Record<Tab, { title: string; sub: string; pill: string }> = {
-    pdf:     { title: 'PDF to Excel',     sub: 'Drop a digitally-generated PDF — we extract the table and map BOM columns automatically.', pill: 'AI column detection' },
+    pdf:     { title: 'PDF to BOM',     sub: 'Drop an engineering PDF — we extract the Bill of Materials into the quote-template format (Excel or Word).', pill: 'BOM extraction' },
     image:   { title: 'Image to Excel',   sub: 'OCR a JPG or PNG of any table. Paste with ⌘V/Ctrl+V or drop a file.', pill: 'Tesseract + smart whitelisting' },
     compare: { title: 'BOM Comparison',   sub: 'Diff two Excel BOMs. Fuzzy matching catches renamed MPNs across revisions.', pill: 'Fuzzy MPN matching' },
   };
