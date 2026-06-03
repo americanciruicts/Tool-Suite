@@ -3264,21 +3264,82 @@ function _timeAgo(ts: number): string {
   const d = Math.floor(h / 24); return `${d}d ago`;
 }
 
+// A row shown on the Recent uploads page. Server rows (history saved on the
+// backend, shared across browsers/devices) carry an `id` and are loaded/opened
+// from the API; local rows fall back to this browser's localStorage when the
+// server is unreachable.
+type RecentRow = {
+  id?: string;
+  ts: number;            // milliseconds
+  kind: RecentItem['kind'];
+  label: string;
+  format?: string;
+  total_rows?: number;
+  server?: boolean;
+  preview?: any;
+};
+
 function RecentActivity({ onOpen }: { onOpen: (it: RecentItem) => void }) {
-  const [items, setItems] = useState<RecentItem[]>([]);
+  const [items, setItems] = useState<RecentRow[]>([]);
+  const [onServer, setOnServer] = useState(true);
+  const [loading, setLoading] = useState(true);
+
+  const readLocal = (): RecentRow[] => {
+    try { const raw = localStorage.getItem(RECENTS_KEY); return raw ? JSON.parse(raw) : []; } catch { return []; }
+  };
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const res = await axios.get(`${getApiBasePath()}/conversions`, { headers: { 'ngrok-skip-browser-warning': 'true' } });
+      const rows: RecentRow[] = (res.data?.items || []).map((e: any) => ({
+        id: e.id,
+        ts: (e.ts || 0) * 1000,
+        kind: e.kind,
+        label: e.original_filename || e.filename || 'conversion',
+        format: e.format,
+        total_rows: e.total_rows,
+        server: true,
+      }));
+      setItems(rows);
+      setOnServer(true);
+    } catch {
+      // Server unavailable → show this browser's saved history instead.
+      setOnServer(false);
+      setItems(readLocal());
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
-    const load = () => {
-      try { const raw = localStorage.getItem(RECENTS_KEY); setItems(raw ? JSON.parse(raw) : []); } catch {}
-    };
     load();
     window.addEventListener('toolsuite-recents-updated', load);
     return () => window.removeEventListener('toolsuite-recents-updated', load);
-  }, []);
+  }, [load]);
 
   const kindLabel = (k: RecentItem['kind']) => k === 'pdf' ? 'PDF → BOM' : k === 'image' ? 'Image → Excel' : 'BOM Comparison';
-  const fmtTag = (it: RecentItem) => it.preview ? (/\.docx$/i.test(it.preview.filename || '') ? 'DOCX' : 'XLSX') : '';
+  const fmtTag = (it: RecentRow) => (it.format === 'word' || /\.docx$/i.test(it?.preview?.filename || '')) ? 'DOCX' : 'XLSX';
 
-  const download = (it: RecentItem) => {
+  const open = async (it: RecentRow) => {
+    if (it.server && it.id) {
+      try {
+        const res = await axios.get(`${getApiBasePath()}/conversions/${it.id}`, { headers: { 'ngrok-skip-browser-warning': 'true' } });
+        onOpen({ ts: it.ts, kind: it.kind, label: it.label, preview: res.data });
+      } catch {}
+    } else {
+      onOpen(it as RecentItem);
+    }
+  };
+
+  const download = (it: RecentRow) => {
+    if (it.server && it.id) {
+      const a = document.createElement('a');
+      a.href = `${getApiBasePath()}/conversions/${it.id}/file`;
+      a.rel = 'noopener';
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      return;
+    }
     const p = it.preview; if (!p?.excel_base64) return;
     try {
       const bin = atob(p.excel_base64); const bytes = new Uint8Array(bin.length);
@@ -3289,40 +3350,70 @@ function RecentActivity({ onOpen }: { onOpen: (it: RecentItem) => void }) {
       document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
     } catch {}
   };
-  const remove = (ts: number) => _writeRecents(items.filter(i => i.ts !== ts));
-  const clearAll = () => _writeRecents([]);
+
+  const remove = async (it: RecentRow) => {
+    if (it.server && it.id) {
+      try { await axios.delete(`${getApiBasePath()}/conversions/${it.id}`); } catch {}
+      load();
+    } else {
+      _writeRecents(readLocal().filter(i => i.ts !== it.ts));
+      setItems(readLocal());
+    }
+  };
+
+  const clearAll = async () => {
+    if (onServer) {
+      try { await axios.delete(`${getApiBasePath()}/conversions`); } catch {}
+      load();
+    } else {
+      _writeRecents([]);
+      setItems([]);
+    }
+  };
+
+  const canOpen = (it: RecentRow) => it.server || !!it.preview;
 
   return (
     <div className="print:hidden max-w-4xl mx-auto">
       <div className="flex items-center justify-between mb-4">
-        <p className="text-sm text-gray-500">{items.length} recent conversion{items.length === 1 ? '' : 's'} (saved in this browser)</p>
+        <p className="text-sm text-gray-500">
+          {loading ? 'Loading…' : `${items.length} recent conversion${items.length === 1 ? '' : 's'}`}
+          {' '}({onServer ? 'saved on the server' : 'saved in this browser'})
+        </p>
         {items.length > 0 && (
           <button onClick={clearAll} className="px-3 py-1.5 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50">Clear all</button>
         )}
       </div>
       {items.length === 0 ? (
         <div className="card p-10 text-center text-gray-500">
-          No recent conversions yet. Convert a PDF or image and it'll show up here — reopen the preview or re-download anytime.
+          No recent conversions yet. Convert a PDF or image and it shows up here — reopen the preview or re-download anytime.
         </div>
       ) : (
         <div className="card divide-y divide-gray-100">
           {items.map(it => (
-            <div key={it.ts} className="flex items-center gap-3 px-4 py-3">
+            <div key={it.id || it.ts} className="flex items-center gap-3 px-4 py-3">
               <span className="text-xl leading-none">{it.kind === 'pdf' ? '📄' : it.kind === 'image' ? '🖼' : '⇄'}</span>
               <div className="flex-1 min-w-0">
-                <p className="font-medium text-gray-900 truncate">{it.label}</p>
-                <p className="text-xs text-gray-500">{kindLabel(it.kind)} · {_timeAgo(it.ts)}{fmtTag(it) ? ` · ${fmtTag(it)}` : ''}</p>
+                {canOpen(it) ? (
+                  <button
+                    onClick={() => open(it)}
+                    title="Click to preview"
+                    className="block w-full text-left font-medium text-gray-900 truncate hover:text-blue-600 hover:underline cursor-pointer"
+                  >
+                    {it.label}
+                  </button>
+                ) : (
+                  <p className="font-medium text-gray-900 truncate">{it.label}</p>
+                )}
+                <p className="text-xs text-gray-500">{kindLabel(it.kind)} · {_timeAgo(it.ts)}{fmtTag(it) ? ` · ${fmtTag(it)}` : ''}{typeof it.total_rows === 'number' && it.total_rows > 0 ? ` · ${it.total_rows} rows` : ''}</p>
               </div>
-              {it.preview && (
-                <button onClick={() => onOpen(it)} className="px-3 py-1.5 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50">Open</button>
+              {canOpen(it) && (
+                <button onClick={() => open(it)} className="px-3 py-1.5 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50">Open</button>
               )}
-              {it.preview?.excel_base64 && (
+              {(it.server || it.preview?.excel_base64) && it.kind !== 'compare' && (
                 <button onClick={() => download(it)} className="px-3 py-1.5 text-sm font-semibold text-white bg-gray-900 rounded-lg hover:bg-black">Download</button>
               )}
-              {it.kind === 'compare' && (
-                <button onClick={() => onOpen(it)} className="px-3 py-1.5 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50">Open</button>
-              )}
-              <button onClick={() => remove(it.ts)} title="Remove" className="p-1.5 text-gray-400 hover:text-red-500">
+              <button onClick={() => remove(it)} title="Remove" className="p-1.5 text-gray-400 hover:text-red-500">
                 <XCircle className="w-5 h-5" />
               </button>
             </div>

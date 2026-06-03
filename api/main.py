@@ -606,6 +606,11 @@ async def _run_pdf_job(job_id: str, content: bytes, filename: str,
         )
         _cache_put(cache_key, payload)
         _JOBS[job_id] = {"status": "done", "payload": payload, "ts": time.time()}
+        try:
+            from conversions_store import save as _save_conversion
+            _save_conversion(payload, filename, "pdf", sha=_sha256_of(content))
+        except Exception:
+            pass
         logger.info(f"PDF job {job_id} done: {filename} ({mode}/{out_format})")
     except ValueError as e:
         _record_error("pdf_validation", str(e), filename=filename)
@@ -656,6 +661,12 @@ async def pdf_to_excel(
     cached = _cache_get(cache_key)
     if cached:
         logger.info(f"Cache hit for PDF {file.filename} ({mode}/{out_format}/{quality})")
+        # Still record the (re-)upload in history so it surfaces in Recent.
+        try:
+            from conversions_store import save as _save_conversion
+            _save_conversion(cached, file.filename, "pdf", sha=_sha256_of(content))
+        except Exception:
+            pass
         return JSONResponse(content={"status": "done", **cached})
 
     _prune_jobs()
@@ -693,6 +704,80 @@ async def pdf_to_excel_options():
     """Handle preflight CORS requests"""
     return {"message": "CORS preflight handled"}
 
+
+# ── Server-side conversion history (Recent uploads) ───────────────────────────
+
+@app.get("/api/conversions")
+async def list_conversions(limit: int = 100):
+    """List recent conversions (newest first) — saved on the server, so the
+    Recent uploads page is shared across browsers/devices and survives a cache
+    clear. Returns lightweight summaries (no file bytes)."""
+    try:
+        from conversions_store import list_recent
+        return JSONResponse(content={"items": list_recent(limit)})
+    except Exception as e:
+        logger.error(f"list conversions failed: {e}")
+        return JSONResponse(content={"items": []})
+
+
+@app.get("/api/conversions/{cid}")
+async def get_conversion(cid: str):
+    """Full preview record for re-opening a stored conversion (columns/rows/
+    metadata — no file bytes; use the /file route to download)."""
+    from conversions_store import get, get_file
+    rec = get(cid)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Conversion not found")
+    # Attach the file bytes so the preview panel's Download works unchanged.
+    got = get_file(cid)
+    if got:
+        rec["excel_base64"] = base64.b64encode(got[0]).decode("ascii")
+    return JSONResponse(content=rec)
+
+
+@app.get("/api/conversions/{cid}/file")
+async def download_conversion(cid: str):
+    """Download the stored converted file (xlsx/docx)."""
+    from conversions_store import get_file
+    got = get_file(cid)
+    if not got:
+        raise HTTPException(status_code=404, detail="File not found")
+    data, filename, mime = got
+    return Response(
+        content=data,
+        media_type=mime,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.delete("/api/conversions/{cid}")
+async def delete_conversion(cid: str):
+    from conversions_store import delete
+    delete(cid)
+    return {"success": True}
+
+
+@app.delete("/api/conversions")
+async def clear_conversions():
+    from conversions_store import clear_all
+    clear_all()
+    return {"success": True}
+
+
+@app.options("/api/conversions")
+async def conversions_options():
+    return {"message": "CORS preflight handled"}
+
+
+@app.options("/api/conversions/{cid}")
+async def conversion_options(cid: str):
+    return {"message": "CORS preflight handled"}
+
+
+@app.options("/api/conversions/{cid}/file")
+async def conversion_file_options(cid: str):
+    return {"message": "CORS preflight handled"}
+
 @app.post("/api/image-to-excel")
 async def image_to_excel(file: UploadFile = File(...)):
     """Extract BOM table from a JPG/PNG screenshot and return a clean Excel file."""
@@ -728,6 +813,11 @@ async def image_to_excel(file: UploadFile = File(...)):
 
         payload = _build_preview_payload(output_path, output_filename, result)
         _cache_put(cache_key, payload)
+        try:
+            from conversions_store import save as _save_conversion
+            _save_conversion(payload, file.filename, "image", sha=_sha256_of(content))
+        except Exception:
+            pass
         return JSONResponse(content=payload)
     except ValueError as e:
         logger.error(f"Image processing validation error: {e}")

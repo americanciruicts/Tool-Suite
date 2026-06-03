@@ -1891,7 +1891,9 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
             try:
                 from layout_parse import parse_bom
                 _p(25, "Parsing parts-list columns")
-                lay_df = parse_bom(pdf_path)
+                # Last-resort layout parse: the grid detector already failed
+                # here, so allow the broader generic item-anchored parser too.
+                lay_df = parse_bom(pdf_path, include_generic=True)
                 if lay_df is not None and not lay_df.empty:
                     lay_bom = _safe_map(lay_df)
                     if lay_bom is not None and len(lay_bom) > text_bom_rows:
@@ -1902,6 +1904,26 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
                         warnings.append("Parsed the drawing's parts-list columns directly.")
             except Exception as e:
                 warnings.append(f"Layout parse error: {e}")
+
+        # 0.5) Cable / wire-harness drawings: the BOM is callouts, not a table.
+        #      Pull connector/pin/wire callouts directly (text layer, or OCR when
+        #      the part numbers were flattened to vector outlines). Deterministic
+        #      and fast — runs before the slow LLM/vision fallbacks.
+        if text_bom_rows < 3:
+            try:
+                from harness_parse import parse_harness_bom
+                _p(28, "Reading harness callouts")
+                harn_df = parse_harness_bom(pdf_path)
+                if harn_df is not None and not harn_df.empty:
+                    harn_bom = _safe_map(harn_df)
+                    if harn_bom is not None and len(harn_bom) > text_bom_rows:
+                        raw_df = harn_df
+                        bom_df = harn_bom
+                        text_bom_rows = len(harn_bom)
+                        extraction_method = 'harness-callouts'
+                        warnings.append("Extracted harness/cable callouts from the drawing.")
+            except Exception as e:
+                warnings.append(f"Harness parse error: {e}")
 
         if (text_bom_rows < 3 or table_data['confidence'] < 0.6) and \
                 os.environ.get("BOM_TEXT_LLM_ENABLED", "false").lower() in ("1", "true", "yes"):
