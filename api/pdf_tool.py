@@ -1801,17 +1801,54 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
 
     # Step 1: Validate digital PDF
     _p(5, "Reading PDF")
-    validate_digital_pdf(pdf_path)
-
-    # Step 2: Detect the BOM table.
     table_data = None
     early_layout = False
+    is_scanned = False
+    try:
+        validate_digital_pdf(pdf_path)
+    except ValueError as e:
+        # Image-only/scanned PDF: don't give up — OCR is the only way in. Other
+        # validation failures (encrypted, corrupt) still propagate.
+        if "scanned" in str(e).lower() or str(e) == ERROR_MESSAGES['scanned_pdf']:
+            is_scanned = True
+        else:
+            raise
+
+    if is_scanned and mode == "bom":
+        # Best-effort OCR extraction (cable/ground-strap & callout drawings).
+        # Return what OCR finds with a loud verify flag, or a clear message.
+        _p(20, "OCR (scanned PDF)")
+        harn_df = None
+        try:
+            from harness_parse import parse_harness_bom
+            harn_df = parse_harness_bom(pdf_path)
+        except Exception:
+            harn_df = None
+        if harn_df is None or len(harn_df) < 2:
+            raise ValueError(
+                "This PDF is scanned/image-only and OCR could not extract a BOM. "
+                "Please provide a digitally generated PDF with selectable text."
+            )
+        table_data = {
+            'table_data': harn_df,
+            'header_row': list(harn_df.columns),
+            'confidence': 0.4,
+            'page_numbers': [1],
+            'extraction_method': 'ocr-scanned',
+        }
+        early_layout = True
+        warnings.append(
+            "Scanned/image-only PDF — extracted via OCR. Verify ALL part numbers "
+            "and descriptions against the drawing."
+        )
+
+    # Step 2: Detect the BOM table.
 
     # Fast path (bom mode): try the deterministic columnar parser first. On
     # engineering drawings this returns the parts list in <1s and lets us skip
     # the slow geometry scan. It returns None for non-columnar BOMs, which then
     # fall through to the normal detection below.
-    if mode == "bom":
+    if mode == "bom" and table_data is None:
         try:
             from layout_parse import parse_bom
             _p(12, "Parsing parts-list columns")
@@ -1834,15 +1871,36 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
         try:
             table_data = detect_bom_table(pdf_path)
         except ValueError as e:
-            fallback = _extract_generic_tables_from_pdf(pdf_path)
-            if fallback is None:
-                raise ValueError(
-                    "No table detected in this PDF. Ensure the PDF contains a table with "
-                    "a header row and at least one data row."
-                ) from e
-            warnings.append(f"BOM detection skipped: {e}. Exporting raw table.")
-            table_data = fallback
-            is_bom_like = False
+            # Grid detection failed. Try the layout parsers (item-anchored
+            # drawing tables + wide gridless PCB/"Part Information" exports)
+            # before giving up — these read clean text-layer columns that have
+            # no gridlines for pdfplumber to find.
+            lay_df = None
+            try:
+                from layout_parse import parse_bom as _layout_parse_bom
+                _p(18, "Parsing text-layer columns")
+                lay_df = _layout_parse_bom(pdf_path, include_generic=True)
+            except Exception:
+                lay_df = None
+            if lay_df is not None and len(lay_df) >= 3:
+                table_data = {
+                    'table_data': lay_df,
+                    'header_row': list(lay_df.columns),
+                    'confidence': 0.85,
+                    'page_numbers': [1],
+                    'extraction_method': 'layout-columns',
+                }
+                early_layout = True
+            else:
+                fallback = _extract_generic_tables_from_pdf(pdf_path)
+                if fallback is None:
+                    raise ValueError(
+                        "No table detected in this PDF. Ensure the PDF contains a table with "
+                        "a header row and at least one data row."
+                    ) from e
+                warnings.append(f"BOM detection skipped: {e}. Exporting raw table.")
+                table_data = fallback
+                is_bom_like = False
 
     if table_data['confidence'] < 0.6:
         warnings.append(f"Table detected with low confidence ({table_data['confidence']:.0%}). Results may require manual review.")

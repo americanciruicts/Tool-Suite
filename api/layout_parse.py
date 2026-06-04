@@ -403,6 +403,215 @@ def parse_generic_table(pdf_path: str, max_pages: int = 8) -> Optional[pd.DataFr
     return None
 
 
+# ---------------------------------------------------------------------------
+# Wide text-layer BOM table parser (PCB / "Part Information" exports).
+#
+# Electronics BOM exports (Altium, WiTricity "Part Information", etc.) are wide
+# tables — Designator | Part Number | Description | Manufacturer | Package | … —
+# often 15-20 columns and hundreds of rows, with NO gridlines and NO item-number
+# column (rows are keyed by reference designator). The grid detector and the
+# item-anchored parser both miss them. `pdftotext -layout` preserves the column
+# alignment, so we read the header line's column character-offsets and slice each
+# data row by them. Maps cleanly downstream (Part Number→MPN, Description, etc.).
+# ---------------------------------------------------------------------------
+
+# Header keywords that mark a wide BOM table header line.
+_WIDE_HEAD = {
+    "designator", "designators", "refdes", "ref des", "reference",
+    "part number", "part no", "part #", "p/n", "mpn", "manufacturer part",
+    "description", "desc", "manufacturer", "mfg", "mfr", "qty", "quantity",
+    "value", "package", "footprint", "comment", "comments", "rohs", "item",
+    "customer", "vendor", "supplier", "tolerance", "voltage",
+}
+# Header must contain a part-number-ish column to be a real BOM.
+_WIDE_PN = ("part number", "part no", "part #", "p/n", "mpn", "manufacturer part")
+
+
+# Known column names that may be glued to a neighbour by a single space in the
+# header (e.g. "ITEM NO. PART NUMBER", "QTY. UOM") — used to split them apart.
+_SPLIT_AT = [
+    "manufacturer part number", "part number", "part no", "mpn", "p/n",
+    "description", "manufacturer", "quantity", "qty", "uom", "value", "package",
+    "footprint", "comment", "designator", "customer", "vendor", "supplier",
+]
+# Column names that begin the drawing's revisions / title block, not the BOM —
+# the BOM table ends here (these tables sit side-by-side on many drawings).
+_TRUNCATE_AT = {
+    "rev", "rev.", "revision", "revisions", "ltr", "zone", "author", "eco",
+    "approved", "appvd", "drawn", "checked", "sheet", "by",
+}
+
+
+def _wide_columns(header: str) -> List[tuple]:
+    """Column (start_offset, name) pairs from a layout header line — each token
+    group separated by 2+ spaces is one column. Merged column names glued by a
+    single space ("ITEM NO. PART NUMBER") are split at the inner column keyword;
+    columns from an adjacent revisions/title block are dropped once the BOM
+    columns (a part number + description) have been seen."""
+    raw = []
+    for m in re.finditer(r"\S(?:.*?\S)?(?=\s{2,}|$)", header):
+        name = m.group().strip()
+        if name:
+            raw.append((m.start(), name))
+
+    # Split a glued "<colA> <colB>" token at the inner keyword's offset.
+    cols: List[tuple] = []
+    for start, name in raw:
+        low = name.lower()
+        cut = None
+        for kw in _SPLIT_AT:
+            i = low.find(kw)
+            if i > 0 and low[i - 1] == " ":  # keyword starts mid-token
+                if cut is None or i < cut:
+                    cut = i
+        if cut is not None:
+            cols.append((start, name[:cut].strip()))
+            cols.append((start + cut, name[cut:].strip()))
+        else:
+            cols.append((start, name))
+
+    # Truncate at the revisions/title block once we have a real BOM (PN + desc).
+    have_pn = False
+    have_desc = False
+    for idx, (start, name) in enumerate(cols):
+        low = name.lower().strip()
+        if any(p in low for p in _WIDE_PN):
+            have_pn = True
+        if "desc" in low:
+            have_desc = True
+        if idx > 0 and low.rstrip(".") in _TRUNCATE_AT and have_pn and have_desc:
+            return cols[:idx] + [(start, "__END__")]  # sentinel marks right edge
+    return cols
+
+
+def _wide_data_starts(lines: List[str], right_edge: int) -> List[int]:
+    """Column start offsets derived from the data rows' whitespace: a column
+    begins at a non-space position preceded by a >=2-wide run of positions that
+    are blank in (almost) every row. Description-internal spaces don't qualify
+    (they aren't blank across all rows), so wide text cells stay intact."""
+    if not lines:
+        return []
+    width = min(max(len(l) for l in lines), right_edge)
+    n = len(lines)
+    gap = []
+    for i in range(width):
+        blank = sum(1 for l in lines if i >= len(l) or l[i] == " ")
+        gap.append(blank >= n - 1)
+    starts = []
+    for i in range(width):
+        if gap[i]:
+            continue
+        if i == 0 or (gap[i - 1] and (i < 2 or gap[i - 2])):
+            starts.append(i)
+    return starts
+
+
+def parse_wide_text_table(pdf_path: str, max_pages: int = 6) -> Optional[pd.DataFrame]:
+    """Parse a wide, gridless text-layer BOM table. Column edges come from the
+    data's whitespace; column names come from the header tokens above them.
+    Returns the table with its own headers, or None."""
+    try:
+        text = _layout_text(pdf_path, max_pages)
+    except Exception:
+        return None
+    if not text.strip():
+        return None
+    lines = text.splitlines()
+
+    # Find the header: a line with >=3 BOM keywords incl. a part-number column.
+    header_idx = None
+    best = -1
+    for idx, l in enumerate(lines[:80]):
+        low = l.lower()
+        hits = sum(1 for k in _WIDE_HEAD if k in low)
+        if hits >= 3 and any(p in low for p in _WIDE_PN) and hits > best:
+            best, header_idx = hits, idx
+    if header_idx is None:
+        return None
+
+    header_cols = _wide_columns(lines[header_idx])
+    # A trailing "__END__" sentinel marks where an adjacent revisions/title block
+    # begins: keep its offset as the BOM's right edge but drop it as a column.
+    right_edge = 10 ** 6
+    if header_cols and header_cols[-1][1] == "__END__":
+        right_edge = header_cols[-1][0]
+        header_cols = header_cols[:-1]
+    if len(header_cols) < 3:
+        return None
+
+    # Column boundaries from the DATA's whitespace "rivers", not the header —
+    # headers are often centred over wide columns, so slicing by header offsets
+    # bleeds a long description's left edge into the part-number column. Data
+    # rows are fixed-width, so the gaps that are blank across (almost) every row
+    # are the true column edges.
+    data_lines = [l for l in lines[header_idx + 1: header_idx + 60]
+                  if l.strip() and l[:right_edge if right_edge < 10**6 else len(l)].strip()][:30]
+    starts = _wide_data_starts(data_lines, right_edge)
+    if len(starts) < 3:
+        # Fall back to header offsets if data-based detection found too few.
+        starts = [c[0] for c in header_cols]
+    # Drop spurious columns from drawing-zone letters (A–H) in the far-left
+    # margin, left of the table's first header token.
+    first_h = header_cols[0][0] if header_cols else 0
+    starts = [s for s in starts if first_h - 2 <= s < right_edge]
+    if len(starts) < 3:
+        return None
+    bounds = starts + [right_edge]
+
+    # Name each data column from the header token nearest its start — one token
+    # to one column, so an over-split data column gets "Column N" rather than
+    # duplicating a real header (which would break downstream mapping).
+    names: List[Optional[str]] = [None] * len(starts)
+    for hs, nm in header_cols:
+        j = min(range(len(starts)), key=lambda k: abs(starts[k] - hs))
+        if names[j] is None:
+            names[j] = nm
+    names = [n if n else f"Column {i + 1}" for i, n in enumerate(names)]
+
+    # The part-number column anchors a real data row — notes/title text below the
+    # table won't have a part-number-like value there.
+    pn_idx = next(
+        (i for i, n in enumerate(names) if any(p in n.lower() for p in _WIDE_PN)),
+        None,
+    )
+    _PN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9\-/.]{3,}$")
+
+    def _valid_row(vals: List[str]) -> bool:
+        if pn_idx is not None and pn_idx < len(vals):
+            tok = vals[pn_idx].strip().split(" ")[0] if vals[pn_idx].strip() else ""
+            return bool(tok) and any(c.isdigit() for c in tok) and bool(_PN_RE.match(tok))
+        # No identifiable PN column → fall back to "some part-number-ish cell".
+        for v in vals[: min(5, len(vals))]:
+            s = v.strip()
+            if len(s) >= 4 and any(c.isalpha() for c in s) and any(c.isdigit() for c in s):
+                return True
+        return False
+
+    rows: List[List[str]] = []
+    for l in lines[header_idx + 1:]:
+        if not l.strip():
+            continue
+        low = l.lower()
+        # Skip a repeated header or page furniture.
+        if sum(1 for k in _WIDE_HEAD if k in low) >= 4:
+            continue
+        vals = [l[bounds[i]:bounds[i + 1]].strip() for i in range(len(starts))]
+        if _valid_row(vals):
+            rows.append(vals)
+
+    if len(rows) < 5:
+        return None
+
+    # De-duplicate blank/repeated column names so the DataFrame is well-formed.
+    seen: Dict[str, int] = {}
+    uniq: List[str] = []
+    for i, n in enumerate(names):
+        n = n or f"Column {i + 1}"
+        seen[n] = seen.get(n, 0) + 1
+        uniq.append(n if seen[n] == 1 else f"{n} ({seen[n]})")
+    return pd.DataFrame(rows, columns=uniq)
+
+
 def parse_bom(pdf_path: str, max_pages: int = 8, include_generic: bool = False) -> Optional[pd.DataFrame]:
     """Best columnar BOM parse: CAGE-anchored coordinate parser first
     (reassembles wrapped cells / full manufacturer names), then the text-layout
@@ -424,10 +633,28 @@ def parse_bom(pdf_path: str, max_pages: int = 8, include_generic: bool = False) 
     if df is not None and len(df) >= 2:
         return df
     if include_generic:
+        def _well_formed(d) -> bool:
+            # Mappable: enough rows and unique column names. Duplicate headers
+            # (a side-by-side revisions table glued onto the BOM) crash the
+            # downstream mapper, so those fall through to the wide-table parser.
+            if d is None or len(d) < 3:
+                return False
+            names = [str(c).lower() for c in d.columns]
+            return len(set(names)) == len(names)
+
         try:
-            return parse_generic_table(pdf_path, max_pages)
+            df = parse_generic_table(pdf_path, max_pages)
+            if _well_formed(df):
+                return df
         except Exception:
-            return None
+            pass
+        try:
+            wide = parse_wide_text_table(pdf_path, max_pages)
+            if _well_formed(wide):
+                return wide
+        except Exception:
+            pass
+        return None
     return None
 
 
