@@ -15,6 +15,7 @@ Key Features:
 import pdfplumber
 import pypdf
 import pandas as pd
+import re
 import tempfile
 import io
 import os
@@ -1694,6 +1695,124 @@ def _pick_best_columns(df: pd.DataFrame) -> Dict[str, str]:
     return chosen
 
 
+# Component categories used to recognise a "config matrix" BOM — a table whose
+# columns hold separate part numbers for DIFFERENT components per row (e.g. a
+# LED part # and a resistor part #), rather than one component per row.
+_COMPONENT_CATS = {
+    "LED", "RESISTOR", "CAPACITOR", "CAP", "DIODE", "IC", "TRANSISTOR", "MOSFET",
+    "CONNECTOR", "INDUCTOR", "CRYSTAL", "OSCILLATOR", "SWITCH", "FUSE", "RELAY",
+    "FERRITE", "SENSOR", "REGULATOR", "TRANSCEIVER", "FILTER", "JUMPER",
+    "HEADER", "COIL", "BATTERY", "BUZZER", "ANTENNA", "MOTOR", "MAGNET",
+    "WIRE", "CABLE", "FAN", "SOCKET", "POTENTIOMETER", "VARISTOR", "THERMISTOR",
+}
+
+
+def _category_of(header: str) -> Optional[str]:
+    """The single component category named in a column header, else None."""
+    words = set(re.findall(r"[A-Za-z]+", str(header).upper()))
+    # Map common plurals/abbreviations back to the canonical category.
+    norm = {w.rstrip("S") if w.rstrip("S") in _COMPONENT_CATS else w for w in words}
+    hits = norm & _COMPONENT_CATS
+    return next(iter(hits)) if len(hits) == 1 else None
+
+
+def _is_partish_column(header: str) -> bool:
+    """A column that holds a part/order number (broader than the strict MPN
+    classifier — matches '… # for Resistor', 'Digikey #', 'Part No', etc.)."""
+    if detect_column_type(str(header)) == "mpn":
+        return True
+    return bool(re.search(r"\bpart\b|\bp/?n\b|\bmpn\b|#", str(header), re.I))
+
+
+def _maker_from_header(h: str) -> str:
+    """Leading maker/distributor name in a part-column header
+    ('All Electronics Part # for LED' → 'All Electronics')."""
+    m = re.split(r"\bpart\b|#|/n|\bp\.?n\b|\bno\b", str(h), flags=re.I)
+    cand = (m[0] if m else "").strip(" -:")
+    cand = re.sub(r"\s+", " ", cand)
+    return cand if 0 < len(cand) <= 24 and _category_of(cand) is None else ""
+
+
+def _explode_component_matrix(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """If the table is a config matrix — separate part numbers for DIFFERENT
+    components per row (… Part # for LED, Digikey # for Resistor) — split it into
+    one row per component. Returns a normalized table (Item No./Part Number/
+    Description/Qty/Manufacturer) or None when it isn't a matrix (the common
+    single-component BOM, so the normal mapping is used)."""
+    cols = list(df.columns)
+
+    def _clean(v):
+        s = "" if v is None else str(v).strip()
+        return "" if s.lower() in ("", "nan", "none") else s
+
+    # The customer/assembly prefix (from the first column or a customer column)
+    # marks columns that hold the customer's own numbering, not the orderable
+    # part number — deprioritise those when choosing a component's part column.
+    assembly_prefix = ""
+    for c in cols:
+        if detect_column_type(str(c)) in ("customer_pn", "item_number") or cols.index(c) == 0:
+            assembly_prefix = _maker_from_header(c).lower()
+            if assembly_prefix:
+                break
+
+    # Group part-ish columns by the component category named in their header.
+    by_cat: Dict[str, List[str]] = {}
+    for c in cols:
+        cat = _category_of(c)
+        if cat and _is_partish_column(c):
+            by_cat.setdefault(cat, []).append(c)
+    if len(by_cat) < 2:
+        return None  # need 2+ distinct components → otherwise a normal BOM
+
+    def _lead(s: str) -> str:  # first two words, lowercased
+        return " ".join(str(s).lower().split()[:2])
+
+    # Pick the best part column per category: prefer a distributor/maker column
+    # over the customer's own number, then the most part-number-like values.
+    def _pick_part_col(cands: List[str]) -> str:
+        def score(c):
+            maker = _maker_from_header(c)
+            is_customer = bool(maker) and bool(assembly_prefix) and _lead(maker) == _lead(assembly_prefix)
+            try:
+                content = score_column_content(df[c].tolist(), "mpn")
+            except Exception:
+                content = 0.0
+            return (not is_customer, content)
+        return max(cands, key=score)
+
+    rows: List[Dict[str, str]] = []
+    seen: set = set()
+    for cat in sorted(by_cat):
+        pn_col = _pick_part_col(by_cat[cat])
+        maker = _maker_from_header(pn_col)
+        # Attribute columns for this component = same-category non-part columns.
+        attr_cols = [c for c in cols
+                     if c != pn_col and _category_of(c) == cat and not _is_partish_column(c)]
+        for _, row in df.iterrows():
+            pn = _clean(row[pn_col])
+            if not pn or len(pn) < 3 or not any(ch.isdigit() for ch in pn):
+                continue
+            if "(cid:" in pn.lower():  # PDF font-encoding artifact, not a real PN
+                continue
+            attrs = [_clean(row[a]) for a in attr_cols if _clean(row[a])]
+            desc = ", ".join([cat.title()] + attrs)
+            key = (pn.upper(), desc.upper())
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({
+                "Item No.": str(len(rows) + 1),
+                "Part Number": pn,
+                "Description": desc,
+                "Qty": "1",
+                "Manufacturer": maker,
+            })
+
+    if len(rows) < 2:
+        return None
+    return pd.DataFrame(rows, columns=["Item No.", "Part Number", "Description", "Qty", "Manufacturer"])
+
+
 def map_to_quote_template_schema(df: pd.DataFrame) -> pd.DataFrame:
     """
     Map an extracted table to the BOM QUOTE TEMPLATE column layout
@@ -1937,6 +2056,24 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
         _p(20, "Mapping BOM columns")
         bom_df = _safe_map(df)
 
+        # Config-matrix tables (separate part numbers per component per row, e.g.
+        # a LED part # and a resistor part # in one row) map to one row when they
+        # should be several. Split them into per-component lines when detected.
+        try:
+            exploded = _explode_component_matrix(df)
+            if exploded is not None and not exploded.empty:
+                exploded_bom = _safe_map(exploded)
+                if exploded_bom is not None and len(exploded_bom) >= max(2, 0 if bom_df is None else len(bom_df)):
+                    raw_df = exploded
+                    bom_df = exploded_bom
+                    extraction_method = 'component-matrix'
+                    warnings.append(
+                        "Detected a multi-component matrix (separate part numbers "
+                        "per component per row) and split it into component lines."
+                    )
+        except Exception:
+            pass
+
         # The geometry parser often *looks* like it found a table on a dense
         # engineering drawing (it grabs the title block) yet yields no real BOM
         # rows. The reliable failure signal is "few/zero mapped BOM rows".
@@ -2034,7 +2171,7 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
         # UI doesn't flash a scary "detection failed / 50%" on a good result.
         _ALT_CONF = {
             'harness-callouts': 0.85, 'layout-columns': 0.9,
-            'ollama-text-llm': 0.8, 'ollama-vision': 0.8,
+            'component-matrix': 0.85, 'ollama-text-llm': 0.8, 'ollama-vision': 0.8,
         }
         if extraction_method in _ALT_CONF and bom_df is not None and len(bom_df) >= 3:
             table_data['confidence'] = max(table_data.get('confidence', 0), _ALT_CONF[extraction_method])
@@ -2047,6 +2184,7 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
             _label = {
                 'harness-callouts': "Extracted the cable/harness callouts (connectors, pins, wires, materials) from the drawing — verify part numbers against the drawing.",
                 'layout-columns': "Parsed the drawing's parts-list table directly.",
+                'component-matrix': "Split a multi-component matrix into one line per component.",
                 'ollama-text-llm': "Structured the parts list with the local AI text model.",
                 'ollama-vision': "Read the drawing with local AI vision.",
             }[extraction_method]
