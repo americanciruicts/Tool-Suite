@@ -1969,6 +1969,32 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
             bom_df = raw_df
             warnings.append("BOM normalization produced no rows; BOM tab mirrors the raw table.")
 
+        # When a dedicated extractor (drawing parts-list, harness callouts, AI)
+        # actually produced a BOM, the earlier grid-detection notes are noise —
+        # they describe a step we recovered from. Replace them with one clear
+        # note and a confidence that reflects the method that succeeded, so the
+        # UI doesn't flash a scary "detection failed / 50%" on a good result.
+        _ALT_CONF = {
+            'harness-callouts': 0.85, 'layout-columns': 0.9,
+            'ollama-text-llm': 0.8, 'ollama-vision': 0.8,
+        }
+        if extraction_method in _ALT_CONF and bom_df is not None and len(bom_df) >= 3:
+            table_data['confidence'] = max(table_data.get('confidence', 0), _ALT_CONF[extraction_method])
+            _noise = (
+                'could not detect a bom table', 'low confidence', 'exporting raw table',
+                'bom detection skipped', 'bom normalization produced no rows',
+                'extracted harness', "parsed the drawing's parts-list columns",
+            )
+            warnings[:] = [w for w in warnings if not any(n in w.lower() for n in _noise)]
+            _label = {
+                'harness-callouts': "Extracted the cable/harness callouts (connectors, pins, wires, materials) from the drawing — verify part numbers against the drawing.",
+                'layout-columns': "Parsed the drawing's parts-list table directly.",
+                'ollama-text-llm': "Structured the parts list with the local AI text model.",
+                'ollama-vision': "Read the drawing with local AI vision.",
+            }[extraction_method]
+            if _label not in warnings:
+                warnings.insert(0, _label)
+
         preview_df = bom_df if (bom_df is not None and not bom_df.empty) else raw_df
         _p(90, "Rendering drawing image")
         images = render_drawing_images(pdf_path)
