@@ -612,6 +612,279 @@ def parse_wide_text_table(pdf_path: str, max_pages: int = 6) -> Optional[pd.Data
     return pd.DataFrame(rows, columns=uniq)
 
 
+# ---------------------------------------------------------------------------
+# Coordinate-space columnar BOM parser (report-style gridless tables).
+#
+# The most common gridless BOMs (ERP "single level BOM report" exports,
+# Agile/Arena BOM exports, PCB part-info lists) are fixed-width columnar tables
+# with NO gridlines and a clear header row. pdfplumber.extract_tables() finds
+# nothing (no lines); the old char-offset text slicer mangled them because it
+# sliced the *reflowed* extract_text() output at the *header label's* character
+# positions, cutting every word mid-character.
+#
+# This parser works in coordinate space instead:
+#   1) find the header row (the line richest in BOM-column keywords),
+#   2) detect each column's LEFT EDGE from the data — a column begins where word
+#      coverage resumes after a >=2pt run that is blank across (nearly) every
+#      row. Detecting left edges (not gap midpoints) keeps a variable-width
+#      cell's trailing words in their own column (a long manufacturer name whose
+#      last word lands in a mostly-blank zone stays in the manufacturer column
+#      instead of leaking into the next), which was the core misalignment bug,
+#   3) assign each data word to a column by its left edge,
+#   4) anchor rows on the item column and merge continuation lines (alternate
+#      manufacturers / wrapped descriptions) into their row,
+#   5) name columns from the header tokens above them.
+# Returns the table with the drawing's own headers; the caller maps it to schema.
+# ---------------------------------------------------------------------------
+
+_CC_HEAD = {
+    "item", "no", "no.", "part", "parts", "number", "num", "p/n", "pn", "mpn",
+    "description", "desc", "qty", "quantity", "req", "reqd", "required",
+    "manufacturer", "mfg", "mfr", "ref", "reference", "designator",
+    "designation", "designators", "cage", "value", "val", "rev", "revision",
+    "uom", "comments", "notes", "model", "bom", "cost", "assy", "per",
+    "lifecycle", "phase", "distributor", "vendor", "supplier", "package",
+    "footprint", "rohs", "customer", "location", "loc", "st", "std", "pkg",
+    "chan", "change", "type",
+}
+_CC_ANCHOR = [
+    {"part", "number", "p/n", "pn", "mpn", "num"},
+    {"description", "desc"},
+    {"qty", "quantity", "req", "reqd", "required", "per"},
+    {"item", "no", "no."},
+    {"manufacturer", "mfg", "mfr"},
+]
+_CC_STOPLINE = re.compile(
+    r"unless|tolerance|proprietary|confidential|^\s*notes?:|drawn by|approved by|copyright",
+    re.I,
+)
+_CC_DASHRUN = re.compile(r"[-]{8,}")
+
+
+def _cc_norm(t: str) -> str:
+    return t.lower().strip().rstrip(".:")
+
+
+def _cc_find_header(words):
+    """Return (header_band_words, header_bottom_y) for the richest BOM header
+    line, or None. Skips title-block / document-header lines by requiring words
+    from >=2 BOM anchor groups and >=3 header keywords on the line."""
+    from collections import defaultdict
+    lines = defaultdict(list)
+    for w in words:
+        lines[round(w["top"] / 3)].append(w)
+    best = None
+    for y in sorted(lines):
+        grp = lines[y]
+        toks = {_cc_norm(w["text"]) for w in grp}
+        hits = sum(1 for a in _CC_ANCHOR if toks & a)
+        kw = sum(1 for w in grp if _cc_norm(w["text"]) in _CC_HEAD)
+        if hits >= 2 and kw >= 3 and len(grp) >= 3:
+            score = (hits, kw)
+            if best is None or score > best[0]:
+                best = (score, y, grp)
+    if not best:
+        return None
+    _, _, grp = best
+    hy = min(w["top"] for w in grp)
+    # Header labels can wrap (QTY / PER ASSY): pull the whole band's keywords.
+    band = [w for w in words
+            if hy - 2 <= w["top"] <= hy + 18 and _cc_norm(w["text"]) in _CC_HEAD]
+    if not band:
+        return None
+    return band, max(w["bottom"] for w in band)
+
+
+def _cc_column_starts(lines, x_lo, x_hi):
+    """Column left edges in coordinate space. occ[i] = #rows covering bin i; a
+    bin is blank if covered in <=~12% of rows; a column starts at a non-blank
+    bin preceded by >=2 blank bins (or the left edge)."""
+    import math
+    rows = [l for l in lines if len(l) >= 2]
+    n = len(rows)
+    if n < 2:
+        return None
+    lo = int(x_lo)
+    hi = int(x_hi) + 1
+    W = hi - lo
+    if W <= 1:
+        return None
+    occ = [0] * W
+    for row in rows:
+        covered = [False] * W
+        for w in row:
+            a = max(lo, int(w["x0"]))
+            b = min(hi, int(w["x1"]) + 1)
+            for i in range(a - lo, b - lo):
+                if 0 <= i < W:
+                    covered[i] = True
+        for i in range(W):
+            if covered[i]:
+                occ[i] += 1
+    tol = max(0, math.ceil(n * 0.12))
+    blank = [occ[i] <= tol for i in range(W)]
+    starts = []
+    for i in range(W):
+        if blank[i]:
+            continue
+        if i == 0 or (blank[i - 1] and (i < 2 or blank[i - 2])):
+            starts.append(lo + i)
+    if not starts:
+        return None
+    return sorted(set(starts)) + [hi]
+
+
+def _cc_name_columns(cuts, band):
+    names = []
+    for k in range(len(cuts) - 1):
+        a, b = cuts[k], cuts[k + 1]
+        toks = [w for w in band if a <= (w["x0"] + w["x1"]) / 2 < b]
+        toks.sort(key=lambda w: (round(w["top"] / 4), w["x0"]))
+        nm = " ".join(w["text"] for w in toks).strip()
+        names.append(nm if nm else f"Column {k + 1}")
+    return names
+
+
+def parse_columnar_coords(pdf_path: str, max_pages: int = 8) -> Optional[pd.DataFrame]:
+    """Parse a gridless, fixed-width columnar BOM from word coordinates. Returns
+    the table with the drawing's own headers, or None if no such table is found
+    (so callers fall through to the other parsers)."""
+    try:
+        import pdfplumber
+        from collections import defaultdict
+    except Exception:
+        return None
+    try:
+        pdf = pdfplumber.open(pdf_path)
+    except Exception:
+        return None
+
+    with pdf:
+        for page in pdf.pages[:max_pages]:
+            try:
+                words = page.extract_words()
+            except Exception:
+                continue
+            if not words:
+                continue
+            hdr = _cc_find_header(words)
+            if not hdr:
+                continue
+            band, header_bottom = hdr
+            x_lo = min(w["x0"] for w in band) - 6
+            x_hi = max(w["x1"] for w in band) + 30
+            body = [w for w in words
+                    if w["top"] > header_bottom + 1
+                    and x_lo - 30 <= (w["x0"] + w["x1"]) / 2 <= x_hi + 30]
+            if not body:
+                continue
+
+            lines_map = defaultdict(list)
+            for w in body:
+                lines_map[round(w["top"] / 4)].append(w)
+            ylines = []
+            for y in sorted(lines_map):
+                ln = sorted(lines_map[y], key=lambda w: w["x0"])
+                # A title-block / notes keyword ends the table region.
+                if _CC_STOPLINE.search(" ".join(w["text"] for w in ln)):
+                    break
+                ylines.append(ln)
+            if len(ylines) < 3:
+                continue
+
+            cuts = _cc_column_starts(ylines, x_lo, x_hi)
+            if not cuts or len(cuts) < 3:
+                continue
+            names = _cc_name_columns(cuts, band)
+            ncol = len(names)
+
+            def colof(w):
+                cx = w["x0"] + 1
+                if cx < cuts[0]:
+                    return 0
+                for i in range(len(cuts) - 1):
+                    if cuts[i] <= cx < cuts[i + 1]:
+                        return i
+                return ncol - 1
+
+            item_idx = next(
+                (i for i, nm in enumerate(names)
+                 if re.search(r"item|^no\b|part", nm.lower())), 0)
+
+            rows: List[List[str]] = []
+            for ln in ylines:
+                cells = ["" for _ in range(ncol)]
+                for w in sorted(ln, key=lambda w: w["x0"]):
+                    ci = colof(w)
+                    if ci is None:
+                        continue
+                    cells[ci] = (cells[ci] + " " + w["text"]).strip()
+                itemval = cells[item_idx].strip()
+                is_anchor = (bool(itemval) and bool(re.search(r"[0-9]", itemval))
+                             and len(itemval.split()) <= 2)
+                nonempty = sum(1 for c in cells if c.strip())
+                if is_anchor or not rows:
+                    if nonempty >= 2:
+                        rows.append(cells)
+                else:
+                    prev = rows[-1]
+                    for i in range(ncol):
+                        if cells[i].strip():
+                            prev[i] = ((prev[i] + " " + cells[i]).strip()
+                                       if prev[i].strip() else cells[i])
+
+            # --- column post-processing -------------------------------------
+            # Merge interior unnamed ("Column N") columns into the previous real
+            # column (a narrow data river inside one logical cell).
+            def _unnamed(nm):
+                return bool(re.match(r"Column \d+$", nm))
+            merged_names: List[str] = []
+            keep_map: List[List[int]] = []
+            for j, nm in enumerate(names):
+                if _unnamed(nm) and merged_names:
+                    keep_map[-1].append(j)
+                else:
+                    merged_names.append(nm)
+                    keep_map.append([j])
+
+            def _join(cells, idxs):
+                return " ".join(cells[k] for k in idxs if cells[k].strip()).strip()
+            rows = [[_join(r, idxs) for idxs in keep_map] for r in rows]
+            names = merged_names
+            # Drop columns empty across all rows.
+            nz = [any(r[c].strip() for r in rows) for c in range(len(names))]
+            names = [names[c] for c in range(len(names)) if nz[c]]
+            rows = [[r[c] for c in range(len(nz)) if nz[c]] for r in rows]
+            if len(names) < 2:
+                continue
+            # Order-preserving token dedup per cell (collapses alt-source repeats
+            # merged from continuation lines, e.g. "AUSTRIA AUSTRIA").
+            def _dedup(cell):
+                seen = set()
+                out = []
+                for t in cell.split():
+                    if t not in seen:
+                        seen.add(t)
+                        out.append(t)
+                return " ".join(out)
+            rows = [[_dedup(c) for c in r] for r in rows]
+            # Keep component rows: >=3 filled cells, a part-number-ish value, and
+            # no long dash run (drops assembly-title / separator lines).
+            good = [r for r in rows
+                    if sum(1 for c in r if c.strip()) >= 3
+                    and any(re.search(r"[A-Za-z].*[0-9]|[0-9].*[A-Za-z]", c) for c in r)
+                    and not any(_CC_DASHRUN.search(c) for c in r)]
+            # De-duplicate column names so the DataFrame is well-formed.
+            seen: Dict[str, int] = {}
+            uniq: List[str] = []
+            for nm in names:
+                seen[nm] = seen.get(nm, 0) + 1
+                uniq.append(nm if seen[nm] == 1 else f"{nm} ({seen[nm]})")
+            if len(good) >= 3:
+                return pd.DataFrame(good, columns=uniq)
+    return None
+
+
 def parse_bom(pdf_path: str, max_pages: int = 8, include_generic: bool = False) -> Optional[pd.DataFrame]:
     """Best columnar BOM parse: CAGE-anchored coordinate parser first
     (reassembles wrapped cells / full manufacturer names), then the text-layout
@@ -642,6 +915,14 @@ def parse_bom(pdf_path: str, max_pages: int = 8, include_generic: bool = False) 
             names = [str(c).lower() for c in d.columns]
             return len(set(names)) == len(names)
 
+        # Coordinate-space columnar parser first — handles report-style gridless
+        # BOMs (ERP/Agile/Arena exports) that the char-offset slicer mangled.
+        try:
+            cc = parse_columnar_coords(pdf_path, max_pages)
+            if _well_formed(cc):
+                return cc
+        except Exception:
+            pass
         try:
             df = parse_generic_table(pdf_path, max_pages)
             if _well_formed(df):

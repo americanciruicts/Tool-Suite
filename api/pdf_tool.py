@@ -787,15 +787,40 @@ def detect_bom_table(pdf_path: str) -> Dict:
                 return True
         return False
 
+    def _coord_result():
+        """Coordinate-space columnar parse for gridless report-style BOMs (ERP/
+        Agile/Arena exports). Most robust gridless path — detects column edges
+        from word coordinates, so it replaces the old char-offset text slicer
+        that cut every cell mid-word. Returns None when no such table is found."""
+        try:
+            from layout_parse import parse_columnar_coords
+            cdf = parse_columnar_coords(pdf_path)
+        except Exception:
+            return None
+        if cdf is not None and len(cdf) >= 3 and _has_valid_mpn_column(cdf):
+            return {
+                'table_data': cdf,
+                'confidence': 0.85,
+                'page_numbers': [1],
+                'header_row': list(cdf.columns),
+                'extraction_method': 'layout-coords',
+            }
+        return None
+
     if not candidates or candidates[0]['score'] < 15:  # Minimum confidence threshold
-        # Try word-position extraction first (most accurate)
+        # Coordinate-space columnar parse first (handles gridless report BOMs).
+        coord_result = _coord_result()
+        if coord_result:
+            return coord_result
+
+        # Try word-position extraction next
         word_result = _extract_bom_by_word_positions(pdf_path)
         if word_result and len(word_result['table_data']) > 0:
             # Verify it has valid columns before accepting
             if _has_valid_mpn_column(word_result['table_data']):
                 return word_result
 
-        # Then try text-based extraction as fallback
+        # Then try text-based extraction as a last resort
         text_result = _extract_table_from_text(pdf_path)
         if text_result and _has_valid_mpn_column(text_result['table_data']):
             return text_result
@@ -812,13 +837,18 @@ def detect_bom_table(pdf_path: str) -> Dict:
     # If not, try word-position or text extraction (handles Zoetis-style PDFs
     # where table structure is detected but data is all concatenated into one column)
     if not _is_table_data_valid(candidates[0]['table']):
-        # Try word-position extraction first
+        # Coordinate-space columnar parse first (handles gridless report BOMs).
+        coord_result = _coord_result()
+        if coord_result:
+            return coord_result
+
+        # Try word-position extraction next
         word_result = _extract_bom_by_word_positions(pdf_path)
         if word_result and len(word_result['table_data']) > 0:
             if _has_valid_mpn_column(word_result['table_data']):
                 return word_result
 
-        # Then try text extraction
+        # Then try text extraction as a last resort
         text_result = _extract_table_from_text(pdf_path)
         if text_result and _has_valid_mpn_column(text_result['table_data']):
             return text_result
@@ -2020,6 +2050,11 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
                 warnings.append(f"BOM detection skipped: {e}. Exporting raw table.")
                 table_data = fallback
                 is_bom_like = False
+
+    # Coordinate/text-layout columnar parses already produce clean, aligned
+    # cells; skip the grid-oriented cleaners (which would re-merge/shift them).
+    if table_data.get('extraction_method') in ('layout-columns', 'layout-coords'):
+        early_layout = True
 
     if table_data['confidence'] < 0.6:
         warnings.append(f"Table detected with low confidence ({table_data['confidence']:.0%}). Results may require manual review.")
