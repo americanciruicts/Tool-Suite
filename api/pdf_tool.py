@@ -1110,6 +1110,9 @@ def map_to_bom_schema(df: pd.DataFrame, extracted_headers: List) -> pd.DataFrame
         col_type = detect_column_type(col)
         if col_type:
             candidates_by_type.setdefault(col_type, []).append(col)
+    # A bare 'P/N' next to a 'MANUFACTURER P/N' is the customer number, not the
+    # MPN — keep the manufacturer column as MPN and demote the rest.
+    _disambiguate_part_number_columns(candidates_by_type)
 
     column_mapping = {}
     for ctype, cols in candidates_by_type.items():
@@ -1336,8 +1339,13 @@ def generate_two_tab_workbook(raw_df: pd.DataFrame, bom_df: pd.DataFrame, output
     normal_ws.title = "Normal"
     _write_sheet(normal_ws, raw_df)
 
+    # BOM sheet always carries the BOM columns. If the mapping found no line items
+    # (a drawing the parsers couldn't read as a BOM), show the headers only — the
+    # raw extraction stays on "Normal" rather than masquerading as the BOM.
+    if bom_df is None:
+        bom_df = pd.DataFrame(columns=BOM_OUTPUT_COLUMNS)
     bom_ws = wb.create_sheet("BOM")
-    _write_sheet(bom_ws, bom_df if bom_df is not None and not bom_df.empty else raw_df)
+    _write_sheet(bom_ws, bom_df)
 
     _add_drawing_sheet(wb, images)
 
@@ -1541,8 +1549,10 @@ def generate_word_bom_document(bom_df: pd.DataFrame, raw_df: pd.DataFrame, outpu
     from docx.enum.section import WD_ORIENT
     from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-    cols = QUOTE_TEMPLATE_COLUMNS  # Item# | Description | Mfg | Mfg P/N | Qty | SMT/TH | Loc
-    widths = [0.5, 3.4, 1.5, 1.6, 0.7, 0.85, 1.0]  # inches, proportional to the template
+    cols = list(bom_df.columns) if bom_df is not None else BOM_OUTPUT_COLUMNS
+    # Proportional inch widths keyed by column name; unknown columns get a default.
+    _W = {"#": 0.4, "Item#": 1.1, "Description": 3.6, "Mfg": 1.5, "Mfg P/N": 1.7, "Qty": 0.6}
+    widths = [_W.get(str(c), 1.2) for c in cols]
 
     def _int(v):
         try:
@@ -1656,9 +1666,12 @@ _NON_PLACED = ("PWB", "PCB", "BARE BOARD", "EPOXY", "ADHESIVE", "SOLDER",
 
 
 def _infer_smt_th(text: str) -> str:
-    """Infer 'SMT' or 'TH' for a part. Bare board / materials → '' (N/A);
-    explicit through-hole packages → 'TH'; otherwise default to 'SMT' (placed
-    components and connectors on an SMT assembly), which the quoter can adjust."""
+    """Infer 'SMT' or 'TH' for a part ONLY when the description/part number gives
+    an explicit signal (a through-hole or surface-mount package keyword). When
+    there is no such signal we leave the cell BLANK rather than guessing — the
+    source drawing doesn't state SMT/TH, so fabricating a value (the old default
+    stamped 'SMT' on every line, including wires/terminals/connectors) is wrong.
+    The quoter fills the blanks. Bare board / materials stay blank too."""
     u = (text or "").upper()
     if any(k in u for k in _NON_PLACED):
         return ""
@@ -1666,7 +1679,7 @@ def _infer_smt_th(text: str) -> str:
         return "TH"
     if any(h in u for h in _SMT_HINTS):
         return "SMT"
-    return "SMT"
+    return ""
 
 
 # Engineering-drawing header phrases the general classifier doesn't know.
@@ -1698,6 +1711,35 @@ def _detect_col_type_eng(col) -> Optional[str]:
     return None
 
 
+# A part-number header that explicitly names the manufacturer — the true MPN.
+# Anything else that classified as 'mpn' (a bare "P/N", a "<customer> P/N", an
+# internal/house number column) is NOT the manufacturer part number.
+_MFG_PN_HEADER_RE = re.compile(r"\b(manufacturer|mfg|mfr|mpn)\b", re.I)
+
+
+def _disambiguate_part_number_columns(candidates: Dict[str, List[str]]) -> None:
+    """In-place: when several columns classify as 'mpn', a header that explicitly
+    names the manufacturer ('MANUFACTURER P/N', 'MFG P/N', 'MPN') is the real MPN;
+    a bare 'P/N' or an internal/customer part column sitting beside it is the
+    customer's own number, not the manufacturer's. Without this, a BOM with both
+    a customer 'P/N' and a 'MANUFACTURER P/N' column (e.g. ThermoFisher harness
+    drawings) maps the customer's number into Mfg P/N and drops the real one,
+    because the customer column is fuller (every row has it) and wins on content
+    score. Reassign the non-manufacturer columns to 'customer_pn'."""
+    mpn_cols = candidates.get("mpn") or []
+    if len(mpn_cols) < 2:
+        return
+    mfg = [c for c in mpn_cols if _MFG_PN_HEADER_RE.search(str(c))]
+    other = [c for c in mpn_cols if not _MFG_PN_HEADER_RE.search(str(c))]
+    if not (mfg and other):
+        return  # all (or none) name a manufacturer → leave content scoring to decide
+    candidates["mpn"] = mfg
+    cust = candidates.setdefault("customer_pn", [])
+    for c in other:
+        if c not in cust:
+            cust.append(c)
+
+
 def _pick_best_columns(df: pd.DataFrame) -> Dict[str, str]:
     """Map each canonical type to its best source column. When several columns
     share a type (e.g. two "Part Number" columns), pick the one whose *values*
@@ -1707,6 +1749,7 @@ def _pick_best_columns(df: pd.DataFrame) -> Dict[str, str]:
         ctype = _detect_col_type_eng(col)
         if ctype:
             candidates.setdefault(ctype, []).append(col)
+    _disambiguate_part_number_columns(candidates)
 
     chosen: Dict[str, str] = {}
     for ctype, cols in candidates.items():
@@ -1843,44 +1886,487 @@ def _explode_component_matrix(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     return pd.DataFrame(rows, columns=["Item No.", "Part Number", "Description", "Qty", "Manufacturer"])
 
 
+# Drawing-annotation fragments that bleed into a parts-list cell when a drawing's
+# leader callouts sit at the same coordinates as a table row (e.g. ThermoFisher
+# harness drawings interleave the BOM with dimension/wire callouts). These shapes
+# are unambiguous drawing noise, safe to strip from ANY cell — note we deliberately
+# DON'T strip a bare inch dimension here (.025" is a real spacing spec in many
+# descriptions); bare-inch stripping is applied only to the Mfg / Mfg P/N fields.
+_NOISE_FRAGMENT_RE = re.compile(
+    r"""
+        \[[^\]]*\]                  # anything bracketed:  [ 7.00"]
+      | \(\s*\d+\s*AWG\s*\)         # wire gauge in parens: (18AWG)
+      | [\[\]]                      # stray bracket
+    """,
+    re.I | re.X,
+)
+# Inch dimension (7.00", .025") — stripped only from maker / part-number fields.
+_INCH_DIM_RE = re.compile(r'\b\d*\.?\d+\s*"')
+# Leader-callout junk tokens inside a part-number cell: a bare 1-2 digit number,
+# a single stray letter, or punctuation. NOT a multi-char token (which could be a
+# real part number — including an alternate MPN we must keep).
+_PN_JUNK_TOKEN_RE = re.compile(r'^(?:\d{1,2}|[A-Za-z]|[^0-9A-Za-z]+)$')
+
+
+def _is_doubled_ocr(tok: str) -> bool:
+    """A vector-text OCR artifact that prints each glyph twice — the part numbers
+    on plotted drawings flatten to outlines and OCR reads 'RJ 45'→'RRJJ 4455',
+    'PIN'→'PPIINN'. All-letter doubled runs are the reliable signal (a doubled
+    *number* like '4455' could be a real value, so we don't flag those)."""
+    if len(tok) < 4 or len(tok) % 2 or not tok.isalpha():
+        return False
+    return all(tok[i] == tok[i + 1] for i in range(0, len(tok), 2))
+
+
+def _is_real_partno(tok: str) -> bool:
+    """A genuine part number, not a bare dimension/coordinate. is_mpn_like accepts
+    '3.00' / '76.2' (a digit + dot passes its char test); those are drawing
+    dimensions that bleed into a cell, not parts. Require a letter, a long digit
+    run, or a hyphen/slash-joined digit group (e.g. 2-520193-2)."""
+    if not is_mpn_like(tok):
+        return False
+    if any(c.isalpha() for c in tok):
+        return True
+    if len(re.sub(r"\D", "", tok)) >= 5:
+        return True
+    return bool(re.search(r"\d[-/]\d", tok))
+
+
+def _clean_bom_cell(value) -> str:
+    """Strip unambiguous drawing-callout noise (bracketed callouts, (NN AWG),
+    doubled-OCR tokens) from one cell. Safe for descriptions — keeps dimensions
+    and real text."""
+    s = str(value)
+    if s.strip().lower() in ("", "nan", "none"):
+        return ""
+    s = _NOISE_FRAGMENT_RE.sub(" ", s)
+    s = " ".join(t for t in s.split() if not _is_doubled_ocr(t))
+    return re.sub(r"\s{2,}", " ", s).strip(" ,;-")
+
+
+# Trailing leader-callout digits on a description ("CABLE, RJ 45 8 10" → the
+# "8 10" are wire-segment leader numbers). Only strip a *run* of 2+ bare integers
+# at the very end, keeping the first of the run (it may be attached, e.g. "RJ 45"):
+# a lone trailing number ("…, 1%, 5") is left untouched, so real specs survive.
+def _strip_trailing_leaders(desc: str) -> str:
+    toks = desc.split()
+    run = 0
+    for t in reversed(toks):
+        if re.fullmatch(r"\d{1,3}", t):
+            run += 1
+        else:
+            break
+    if run >= 2:
+        toks = toks[: len(toks) - (run - 1)]
+    return " ".join(toks)
+
+
+def _clean_description_cell(value) -> str:
+    return _strip_trailing_leaders(_clean_bom_cell(value))
+
+
+def _clean_partno_cell(value) -> str:
+    """Clean a part-number cell: drop drawing leader-callout tokens (bare 1-2 digit
+    numbers, single stray letters, punctuation) but KEEP every multi-char token —
+    so alternate MPNs in one cell ('GMC… CMC… C0603…') are preserved and only the
+    leader junk ('305247H03 2 3 R 4 [' → '305247H03') is removed."""
+    s = _INCH_DIM_RE.sub(" ", _clean_bom_cell(value))
+    kept = [t for t in s.split() if not _PN_JUNK_TOKEN_RE.match(t)]
+    return " ".join(kept)
+
+
+def _has_real_partno(value) -> bool:
+    s = _INCH_DIM_RE.sub(" ", _clean_bom_cell(value))
+    return any(_is_real_partno(t) for t in s.split())
+
+
+# A quantity token: an integer or decimal, optionally carrying a length unit the
+# BOM states the count in — an inch mark ("), a foot mark ('), or a trailing unit
+# word (e.g. '1.5 m', '18 in'). Length-based line items (wire/tape/cable) quote
+# qty this way, so the unit must survive into the Qty cell.
+_QTY_TOKEN_RE = re.compile(r'\d+(?:\.\d+)?(?:["\']|\s?(?:mm|cm|m|in|ft|yd))?$', re.I)
+
+
+def _normalize_qty_number(tok: str) -> str:
+    """Tidy a numeric qty token: drop a redundant decimal tail ('2.00' → '2',
+    '2.50' → '2.5') but keep a genuine fraction ('0.25' → '0.25'). A value that
+    carries a unit ('50.00"', "18'", '1.5 m') is returned untouched."""
+    if not re.fullmatch(r'\d+(?:\.\d+)?', tok):  # has a unit suffix → leave as-is
+        return tok
+    m = re.fullmatch(r'(\d+)(?:\.(\d+))?', tok)
+    whole, frac = m.group(1), (m.group(2) or "")
+    if not frac or int(frac) == 0:
+        return str(int(whole))
+    return f"{int(whole)}.{frac.rstrip('0')}"
+
+
+def _clean_qty_cell(value) -> str:
+    """A quantity is one number, optionally with a unit ('50.00"', "18'", '1.5').
+    Multiple tokens mean leader-callout digits bled in ('1 9 10 14' → '1') — keep
+    the first qty-like one. Whole-number decimals are normalized ('2.00' → '2')."""
+    s = _clean_bom_cell(value)
+    toks = s.split()
+    if len(toks) <= 1:
+        return _normalize_qty_number(s) if _QTY_TOKEN_RE.fullmatch(s) else s
+    for t in toks:
+        if _QTY_TOKEN_RE.fullmatch(t):
+            return _normalize_qty_number(t)
+    return ""
+
+
+def _clean_mfg_cell(value) -> str:
+    """A manufacturer is a name. Drop stray bare-integer leader callouts and inch
+    dimensions that bled onto the maker cell from the drawing ('1 4 7.00" BK 7' →
+    'BK'), but keep real names incl. single-letter tokens ('T & B', '3M')."""
+    toks = _INCH_DIM_RE.sub(" ", _clean_bom_cell(value)).split()
+    while toks and re.fullmatch(r"\d{1,3}", toks[0]):
+        toks.pop(0)
+    while toks and re.fullmatch(r"\d{1,3}", toks[-1]):
+        toks.pop()
+    return " ".join(toks)
+
+
+# Wire-colour codes that bleed onto a cable row's maker cell from drawing leaders
+# (the CABLE row picking up "BK"). Real makers this short ("TE", "3M") aren't here.
+_WIRE_COLORS = {"BK", "BR", "RD", "OR", "YL", "GN", "BU", "VT", "GY", "WH",
+                "BL", "GR", "WT", "PK", "TN"}
+
+
+def _split_glued_mfg_pn(mfg: str, pn: str) -> Tuple[str, str]:
+    """A coordinate parser sometimes glues the maker name and its part number into
+    the Mfg cell ('HIROSE MDF6-14DS-3.5C') and leaves Mfg P/N blank. Split them:
+    trailing token(s) that carry a digit and look like a part number become the
+    Mfg P/N; the leading name stays in Mfg. Only acts when Mfg P/N is blank and a
+    real maker name (a leading word with no digit) remains — so 'T & B', 'AMP',
+    'AUSTRIA MICRO SY', 'Rohm CAL-CHIP' are left untouched."""
+    mfg = (mfg or "").strip()
+    if (pn or "").strip() or not mfg:
+        return mfg, pn
+    toks = mfg.split()
+    if len(toks) < 2:
+        return mfg, pn
+    i = len(toks)
+    while i > 1 and is_mpn_like(toks[i - 1]) and any(c.isdigit() for c in toks[i - 1]):
+        i -= 1
+    if i < len(toks):
+        name = " ".join(toks[:i])
+        if re.search(r"[A-Za-z]", name) and not any(c.isdigit() for c in toks[i - 1]):
+            return name, " ".join(toks[i:])
+    return mfg, pn
+
+
+def _blank_color_leader_mfg(mfg: str, desc: str) -> str:
+    """Drop a stray wire-colour leader sitting in the maker cell of a wire/cable
+    row ('CABLE, RJ 45' / Mfg 'BK' → '')."""
+    if (mfg or "").strip().upper() in _WIRE_COLORS and re.search(
+            r"\b(WIRE|CABLE|HARNESS|CORD|LEAD)\b", desc or "", re.I):
+        return ""
+    return mfg
+
+
+_REAL_WORD_RE = re.compile(r"[A-Za-z]{3,}")
+
+
+def _is_drawing_junk_row(desc: str, mpn: str) -> bool:
+    """A row that is drawing noise rather than a component line: doubled-OCR text,
+    or no real descriptive word AND no usable part number."""
+    if any(_is_doubled_ocr(t) for t in str(desc).split()):
+        return True
+    has_word = bool(_REAL_WORD_RE.search(_clean_bom_cell(desc)))
+    return not has_word and not _has_real_partno(mpn)
+
+
+# Clean "BOM" tab column layout (replaces the rigid quote-template form):
+#   # ......... sequential line number (always 1..N over kept rows)
+#   Item# ..... the customer's / house part number when the BOM carries one
+#   Description, Mfg, Mfg P/N, Qty
+BOM_OUTPUT_COLUMNS = ["#", "Item#", "Description", "Mfg", "Mfg P/N", "Qty"]
+
+# Lifecycle-phase words that sit between a merged description and its trailing
+# quantity on report-style BOMs (Agile/Arena exports): '…desc Production 1'.
+_LIFECYCLE_RE = (r"(?:production|prototype|pre-?production|active|inactive|"
+                 r"obsolete|preliminary|released|eol|nrnd)")
+
+# Bottom-row qty bleed: a description ending in '<qty> <run of 2+ single digits>'
+# where the trailing run is drawing border zone-labels, not part of the qty.
+_DESC_TAIL_QTY_RE = re.compile(r"^(.*?\S)\s+(\d+(?:\.\d+)?[\"']?)\s+(\d(?:\s+\d){1,})\s*$")
+
+
+def _collapse_ws(value) -> str:
+    """One line, single-spaced — fold wrapped/multi-line cell text into a row."""
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def _is_blank_cell(s: str) -> bool:
+    return str(s).strip().lower() in ("", "nan", "none")
+
+
+def _looks_like_part_codes(values) -> bool:
+    """A column of customer/house part numbers: short alphanumeric codes that
+    carry a digit (e.g. '030-00018', '95011025-E', 'A12345'), in most rows."""
+    vals = [str(v).strip() for v in values if not _is_blank_cell(v)]
+    if len(vals) < 2:
+        return False
+    def _code(s: str) -> bool:
+        return (bool(re.search(r"\d", s)) and 3 <= len(s.replace(" ", "")) <= 24
+                and len(s.split()) <= 2)
+    return sum(1 for v in vals if _code(v)) / len(vals) >= 0.5
+
+
+def _qty_integer_fraction(values) -> float:
+    """Fraction of a column's non-blank cells that read as a small whole count
+    (1..9999) — the signature of a Qty column the header detector missed."""
+    vals = [str(v).strip() for v in values if not _is_blank_cell(v)]
+    if len(vals) < 2:
+        return 0.0
+    n_int = sum(1 for v in vals
+                if re.fullmatch(r"\d{1,4}", v) and 1 <= int(v) <= 9999)
+    return n_int / len(vals)
+
+
+# Header words that name a NON-quantity engineering field — never adopt these as
+# Qty even when they hold small integers (package '0402', voltage '50', etc.).
+_NONQTY_HEADER_RE = re.compile(
+    r"pack|footprint|value|tol|volt|current|power|material|type|rev|revis|"
+    r"size|dim|temp|design|rohs|smd|tuned|fitted|phase|lifecycle|θ|\bjc\b|"
+    r"\bja\b|date|year|cage|gauge|awg|freq|ohm|watt|pos\b|pin|class|grade|"
+    r"length|width|height|weight|diam|pitch", re.I)
+
+
+def _recover_qty_column(df: pd.DataFrame, chosen: Dict[str, str]) -> Optional[str]:
+    """When no Qty column was detected by header, adopt an unclaimed column that
+    genuinely looks like quantities (e.g. a column the coordinate parser
+    mislabelled 'Chan'). Guards, so it works on ANY BOM without inventing a Qty:
+      - skip columns whose header names a non-qty field (Package, Voltage, Value…),
+      - require decent fill and >=70% small whole numbers,
+      - require those numbers be SMALL (>=80% <=99) — rejects package/voltage codes
+        like '1206'/'630' which are integers but never quantities."""
+    used = set(chosen.values())
+    n = len(df)
+    best, best_frac = None, 0.0
+    for c in df.columns:
+        if c in used or _NONQTY_HEADER_RE.search(str(c)):
+            continue
+        nonblank = [str(v).strip() for v in df[c].tolist() if not _is_blank_cell(v)]
+        if len(nonblank) < max(2, n * 0.4):
+            continue
+        ints = [int(v) for v in nonblank
+                if re.fullmatch(r"\d{1,4}", v) and 1 <= int(v) <= 9999]
+        if len(ints) < 0.7 * len(nonblank):
+            continue
+        if sum(1 for x in ints if x <= 99) < 0.8 * len(ints):
+            continue  # values too large to be quantities (package/voltage codes)
+        frac = len(ints) / len(nonblank)
+        if frac > best_frac:
+            best, best_frac = c, frac
+    return best
+
+
+def _pick_item_number_source(df: pd.DataFrame, chosen: Dict[str, str]) -> Optional[str]:
+    """The column to surface as 'Item#': the customer/house part number when the
+    BOM has one (a dedicated customer-PN column, an item-number column, or — as a
+    fallback — a leading code column the header detector left unnamed)."""
+    if "customer_pn" in chosen:
+        return chosen["customer_pn"]
+    if "item_number" in chosen:
+        return chosen["item_number"]
+    cols = list(df.columns)
+    used = set(chosen.values())
+    # Leftmost unused column of house/customer part codes that sits BEFORE the
+    # Mfg P/N column (the customer's own number precedes the manufacturer's).
+    mpn_idx = cols.index(chosen["mpn"]) if "mpn" in chosen else len(cols)
+    for i, c in enumerate(cols):
+        if i >= mpn_idx or c in used:
+            continue
+        if _looks_like_part_codes(df[c].tolist()):
+            return c
+    return None
+
+
+# A house/internal part number: 3+ numeric groups joined by dashes (e.g.
+# '173-000022-01'). Distinct from a manufacturer MPN, which carries letters or is
+# a 1-2 group number (AMP '350210-1', Molex '836119006').
+_HOUSE_PN_RE = re.compile(r"^\d{2,4}-\d{3,}-\d{1,}$")
+
+
+def _looks_like_house_pn(values) -> bool:
+    """A column of customer/house item numbers (3-group dashed numerics)."""
+    vals = [str(v).strip().split()[0] for v in values if not _is_blank_cell(v)]
+    vals = [v for v in vals if v]
+    if len(vals) < 2:
+        return False
+    return sum(1 for v in vals if _HOUSE_PN_RE.match(v)) / len(vals) >= 0.6
+
+
+def _split_pn_word_bleed(pn: str, desc: str) -> Tuple[str, str]:
+    """The column slicer sometimes pulls the description's leading WORD into the
+    part-number cell ('173-000022-01 CARTON', '206-000080-01 USER'). Move trailing
+    pure-alphabetic word(s) back to the front of the description, keeping the part
+    number. Guarded: the first token must be the part number (carries a digit) and
+    every following token must be a plain word — so a digit-bearing alternate MPN
+    ('305247H03 C0603') is never disturbed."""
+    pn = (pn or "").strip()
+    toks = pn.split()
+    if len(toks) < 2:
+        return pn, desc
+    head, rest = toks[0], toks[1:]
+    if not any(c.isdigit() for c in head):
+        return pn, desc
+    # A bled description word is alphabetic once trailing punctuation ('CARTON,')
+    # is set aside; an alternate MPN carries a digit, so it never qualifies.
+    def _is_word(t: str) -> bool:
+        core = t.strip(",.;:()")
+        return core.isalpha() and len(core) >= 2
+    if all(_is_word(t) for t in rest):
+        moved = " ".join(rest)
+        desc = (moved + " " + desc).strip() if str(desc).strip() else moved
+        return head, desc
+    return pn, desc
+
+
 def map_to_quote_template_schema(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Map an extracted table to the BOM QUOTE TEMPLATE column layout
-    (Item# | Description | Mfg | Mfg P/N | Qty | SMT/TH | Loc).
+    Map an extracted table to the clean "BOM" tab layout
+    (# | Item# | Description | Mfg | Mfg P/N | Qty).
 
-    This is the "BOM" tab. The lossless raw table lives on the "Normal" tab, so
-    here we keep only the stakeholder columns and drop rows that carry neither a
-    part number nor a description (header echoes, note lines, blanks).
+    The lossless raw table lives on the "Normal" tab, so here we keep only the
+    stakeholder columns and drop rows that carry neither a part number nor a
+    description (header echoes, note lines, blanks). 'Item#' carries the
+    customer's own part number when the BOM has one; '#' is a fresh 1..N counter.
     """
     chosen = _pick_best_columns(df)
 
-    out = pd.DataFrame()
-    out["Item#"] = (
-        df[chosen["item_number"]].astype(str)
-        if "item_number" in chosen else [str(i) for i in range(1, len(df) + 1)]
-    )
+    # Header detection misses the Qty column on some report-style BOMs (the value
+    # lands under a mislabelled neighbour). Adopt a clearly-quantity column when
+    # none was mapped, so the count isn't silently dropped.
+    if "qty" not in chosen:
+        recovered = _recover_qty_column(df, chosen)
+        if recovered is not None:
+            chosen["qty"] = recovered
+
+    item_src = _pick_item_number_source(df, chosen)
+
+    # A sole part column that is a house/internal number (3-group dashed numeric)
+    # with NO manufacturer column is the customer's item number, not a maker MPN
+    # (packaging BOMs: WiTricity '173-000022-01', cartons/fillers/labels). Surface
+    # it as Item# and leave Mfg P/N blank rather than mislabelling it the Mfg P/N.
+    if (item_src is None and "manufacturer" not in chosen and "mpn" in chosen
+            and _looks_like_house_pn(df[chosen["mpn"]].tolist())):
+        item_src = chosen.pop("mpn")
+
+    # Seed with df's index so scalar-filled columns span every source row (an
+    # index-less frame would collapse to 0 rows when nothing maps from df).
+    out = pd.DataFrame(index=df.index)
+    out["Item#"] = df[item_src].astype(str) if item_src is not None else ""
     out["Description"] = df[chosen["description"]].astype(str) if "description" in chosen else ""
     out["Mfg"] = df[chosen["manufacturer"]].astype(str) if "manufacturer" in chosen else ""
     out["Mfg P/N"] = df[chosen["mpn"]].astype(str) if "mpn" in chosen else ""
     out["Qty"] = df[chosen["qty"]].astype(str) if "qty" in chosen else ""
-    # SMT/TH isn't an explicit column on the drawing — infer it from each part's
-    # package/footprint in the description + part number.
-    mpn_series = df[chosen["mpn"]].astype(str) if "mpn" in chosen else pd.Series([""] * len(out))
-    out["SMT/TH"] = [
-        _infer_smt_th(f"{d} {p}") for d, p in zip(out["Description"], list(mpn_series))
-    ]
-    out["Loc"] = df[chosen["refdes"]].astype(str) if "refdes" in chosen else ""
+    out["_refdes"] = df[chosen["refdes"]].astype(str) if "refdes" in chosen else ""
+
+    # Recover a Qty the coordinate parser merged onto the TAIL of another column.
+    # Report-style BOMs glue 'Quantity' onto the refdes ('D1, D2  2') or onto the
+    # description+lifecycle ('…,1%,06P03 Production 1'). When no standalone qty
+    # column was found but a chosen column's header names quantity, split the
+    # trailing integer (after an optional lifecycle-phase word) back out into Qty.
+    if "qty" not in chosen:
+        for field, header_col, strip_tail in (
+            ("_refdes", chosen.get("refdes"), False),
+            ("Description", chosen.get("description"), True),
+        ):
+            if not header_col or not re.search(r"\b(qty|quantity)\b", str(header_col), re.I):
+                continue
+            qtys, kept, hits = [], [], 0
+            for v in out[field]:
+                s = _collapse_ws(v)
+                m = re.search(r"(?:\s+" + _LIFECYCLE_RE + r")?\s+(\d{1,4})$", s, re.I)
+                if m:
+                    qtys.append(m.group(1)); hits += 1
+                    kept.append(s[:m.start()].strip())
+                else:
+                    qtys.append(""); kept.append(s)
+            if hits >= max(1, (len(out) + 1) // 2):  # only if most rows carry a tail qty
+                out["Qty"] = qtys
+                if strip_tail:
+                    out["Description"] = kept
+                break
+
+    # Scrub drawing-callout noise that bled into the stakeholder cells, then drop
+    # rows that are pure drawing noise (no real description and no part number).
+    keep = [not _is_drawing_junk_row(d, p) for d, p in zip(out["Description"], out["Mfg P/N"])]
+    out = out[keep].reset_index(drop=True)
+    if out.empty:
+        return pd.DataFrame(columns=BOM_OUTPUT_COLUMNS)
+    out["Item#"] = out["Item#"].apply(_collapse_ws)
+
+    # Move a description word that the column slicer pulled into the part-number
+    # cell ('173-000022-01 CARTON' → PN '173-000022-01' + 'CARTON' to description)
+    # back where it belongs. Applies to whichever cell holds the number (Item# for
+    # a house-PN packaging BOM, else Mfg P/N).
+    _il = out.columns.get_loc("Item#")
+    _pl = out.columns.get_loc("Mfg P/N")
+    _dl0 = out.columns.get_loc("Description")
+    for _i in range(len(out)):
+        _d = str(out.iat[_i, _dl0])
+        for _cl in (_il, _pl):
+            _newpn, _d = _split_pn_word_bleed(str(out.iat[_i, _cl]), _d)
+            out.iat[_i, _cl] = _newpn
+        out.iat[_i, _dl0] = _d
+
+    # A Qty that bled into the description tail on the table's bottom row: the
+    # drawing's border zone-labels overlap the last cells and push the count out
+    # of the Qty column ('…375-SERIES, CLEAR 1.5 6 7 4 3 2 1' with Qty blank, the
+    # trailing '6 7 4 3 2 1' being drawing zones). Recover it only when Qty is
+    # blank and the description ends with '<qty> <run of 2+ single-digit zones>',
+    # so a description that simply ends in a number is left alone.
+    _qloc = out.columns.get_loc("Qty")
+    _dloc = out.columns.get_loc("Description")
+    for _i in range(len(out)):
+        if str(out.iat[_i, _qloc]).strip():
+            continue
+        _m = _DESC_TAIL_QTY_RE.match(_collapse_ws(out.iat[_i, _dloc]))
+        if _m:
+            out.iat[_i, _qloc] = _m.group(2)
+            out.iat[_i, _dloc] = _m.group(1)
+
+    out["Description"] = out["Description"].apply(_clean_description_cell)
+    out["Mfg"] = out["Mfg"].apply(_clean_mfg_cell)
+    out["Mfg P/N"] = out["Mfg P/N"].apply(_clean_partno_cell)
+    out["Qty"] = out["Qty"].apply(_clean_qty_cell)
+
+    # Repair maker/part-number cells: un-glue a 'HIROSE MDF6-14DS-3.5C' maker cell
+    # into Mfg + Mfg P/N, and drop stray wire-colour leaders from a cable's maker.
+    for _i in range(len(out)):
+        _mfg, _pn = _split_glued_mfg_pn(str(out.iat[_i, out.columns.get_loc("Mfg")]),
+                                        str(out.iat[_i, out.columns.get_loc("Mfg P/N")]))
+        _mfg = _blank_color_leader_mfg(_mfg, str(out.iat[_i, out.columns.get_loc("Description")]))
+        out.iat[_i, out.columns.get_loc("Mfg")] = _mfg
+        out.iat[_i, out.columns.get_loc("Mfg P/N")] = _pn
 
     # Keep only real line items: must have a part number or a description.
     def _has(v) -> bool:
-        s = str(v).strip().lower()
-        return s not in ("", "nan", "none")
+        return not _is_blank_cell(v)
 
     mask = out["Mfg P/N"].apply(_has) | out["Description"].apply(_has)
     out = out[mask].reset_index(drop=True)
-    # Renumber Item# sequentially if the source had no usable item column.
-    if "item_number" not in chosen:
-        out["Item#"] = [str(i) for i in range(1, len(out) + 1)]
+
+    # A per-designator placement list with NO quantities anywhere (one row per
+    # reference designator, the same part repeated) → consolidate into a
+    # purchasing BOM: one row per Mfg P/N, Qty = number of placements. Guarded so
+    # it only fires when Qty is entirely blank AND parts actually repeat — a real
+    # BOM that merely omits qty, or one already one-row-per-part, is left as-is.
+    _q = out["Qty"].astype(str).str.strip()
+    _pn = out["Mfg P/N"].astype(str).str.strip()
+    if len(out) > 1 and (_q == "").all() and _pn[_pn != ""].duplicated().any():
+        keys = [p if p else f"__uniq{i}__" for i, p in enumerate(_pn)]
+        grouped = out.assign(_g=keys).groupby("_g", sort=False)
+        out = grouped.agg({"Item#": "first", "Description": "first",
+                           "Mfg": "first", "Mfg P/N": "first"}).reset_index(drop=True)
+        out["Qty"] = [str(n) for n in grouped.size().tolist()]
+
+    # Fresh 1..N line counter over the kept rows.
+    out.insert(0, "#", [str(i) for i in range(1, len(out) + 1)])
+    out = out[BOM_OUTPUT_COLUMNS]
     return out
 
 
@@ -2079,6 +2565,7 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
 
     raw_df = df
     bom_df = None
+    ai_verify_report = None
 
     if mode == "bom":
         # BOM-aware output. First map the text-extracted table to the BOM schema.
@@ -2195,9 +2682,9 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
                 except Exception as e:
                     warnings.append(f"AI vision fallback error: {e}")
 
-        if bom_df is None:
-            bom_df = raw_df
-            warnings.append("BOM normalization produced no rows; BOM tab mirrors the raw table.")
+        if bom_df is None or bom_df.empty:
+            bom_df = pd.DataFrame(columns=BOM_OUTPUT_COLUMNS)
+            warnings.append("BOM normalization produced no rows; see the Normal tab for the raw extraction.")
 
         # When a dedicated extractor (drawing parts-list, harness callouts, AI)
         # actually produced a BOM, the earlier grid-detection notes are noise —
@@ -2226,6 +2713,38 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
             if _label not in warnings:
                 warnings.insert(0, _label)
 
+        # Agentic verify/repair: a second opinion from the local on-prem Ollama
+        # vision model, reconciled cell-by-cell against the deterministic BOM.
+        # Only fires when the table looks weak and the VLM is reachable (else a
+        # no-op), so clean BOMs stay fast. Repairs suspect cells, flags genuine
+        # disagreements for review — never silently overwrites a good value.
+        ai_verify_report = None
+        if bom_df is not None and not bom_df.empty:
+            try:
+                from bom_verify import verify_and_repair, ai_verify_available
+                if ai_verify_available():
+                    _p(88, "AI verifying extracted BOM")
+                    bom_df, ai_verify_report = verify_and_repair(
+                        bom_df, pdf_path,
+                        det_confidence=table_data.get('confidence', 1.0),
+                        progress_cb=progress_cb,
+                    )
+                    if ai_verify_report and ai_verify_report.get("ran"):
+                        nch = len(ai_verify_report.get("changes", []))
+                        nfl = len(ai_verify_report.get("flags", []))
+                        bits = []
+                        if nch:
+                            bits.append(f"corrected {nch} cell(s)")
+                        if nfl:
+                            bits.append(f"flagged {nfl} cell(s) to verify")
+                        warnings.append(
+                            "Local AI vision cross-checked the parts list"
+                            + (" — " + ", ".join(bits) if bits else " — no discrepancies")
+                            + "."
+                        )
+            except Exception as e:
+                warnings.append(f"AI verify pass skipped: {e}")
+
         preview_df = bom_df if (bom_df is not None and not bom_df.empty) else raw_df
         _p(90, "Rendering drawing image")
         images = render_drawing_images(pdf_path)
@@ -2234,15 +2753,10 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
             generate_word_bom_document(bom_df, raw_df, output_excel_path, images=images)
             sheets = ["BOM (quote)", "Normal (raw)", "Drawing"]
         else:
-            # Fill the stakeholder quote template; fall back to the plain
-            # two-tab workbook if the template can't be loaded.
-            try:
-                generate_template_bom_workbook(bom_df, raw_df, output_excel_path, images=images)
-                sheets = ["BOM (quote template)", "Normal (raw)", "Drawing"]
-            except Exception as e:
-                warnings.append(f"Quote-template export failed, used plain layout: {e}")
-                generate_two_tab_workbook(raw_df, bom_df, output_excel_path, images=images)
-                sheets = ["Normal", "BOM", "Drawing"]
+            # Clean two-tab workbook: "BOM" (# | Item# | Description | Mfg |
+            # Mfg P/N | Qty) selected, "Normal" (lossless raw), plus "Drawing".
+            generate_two_tab_workbook(raw_df, bom_df, output_excel_path, images=images)
+            sheets = ["BOM", "Normal", "Drawing"]
     else:
         # Normal: any PDF → raw table, single sheet/table, no BOM normalization.
         preview_df = raw_df
@@ -2297,6 +2811,7 @@ def extract_bom_from_pdf(pdf_path: str, output_excel_path: str,
             'format': out_format,
             'bom_rows': len(bom_df) if bom_df is not None else 0,
             'sheets': sheets,
+            'ai_verify': ai_verify_report,
         },
         'warnings': warnings
     }

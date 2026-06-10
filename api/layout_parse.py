@@ -807,9 +807,14 @@ def parse_columnar_coords(pdf_path: str, max_pages: int = 8) -> Optional[pd.Data
                         return i
                 return ncol - 1
 
+            # The item/anchor column defines row boundaries: a column whose header
+            # names item/line/no — NOT 'Part Number'/'Mfg Part Num' (those are the
+            # MPN). Matching 'part' anchored rows on the MPN, so a line item with a
+            # blank MPN (e.g. a PWB sub-assembly) merged into the row above it.
+            # Fall back to the leftmost column, which carries the line's item no.
             item_idx = next(
                 (i for i, nm in enumerate(names)
-                 if re.search(r"item|^no\b|part", nm.lower())), 0)
+                 if re.search(r"\bitem\b|\bline\b|^no\.?$", nm.lower())), 0)
 
             rows: List[List[str]] = []
             for ln in ylines:
@@ -868,12 +873,22 @@ def parse_columnar_coords(pdf_path: str, max_pages: int = 8) -> Optional[pd.Data
                         out.append(t)
                 return " ".join(out)
             rows = [[_dedup(c) for c in r] for r in rows]
-            # Keep component rows: >=3 filled cells, a part-number-ish value, and
-            # no long dash run (drops assembly-title / separator lines).
-            good = [r for r in rows
-                    if sum(1 for c in r if c.strip()) >= 3
-                    and any(re.search(r"[A-Za-z].*[0-9]|[0-9].*[A-Za-z]", c) for c in r)
-                    and not any(_CC_DASHRUN.search(c) for c in r)]
+            # Keep component rows: >=3 filled cells, no long dash run (drops
+            # assembly-title / separator lines), and a real line identity — either
+            # a part-number-ish alphanumeric cell, OR (for a no-MPN line item like
+            # a PWB sub-assembly) an item-number value plus a worded description.
+            def _row_ok(r: List[str]) -> bool:
+                if sum(1 for c in r if c.strip()) < 3:
+                    return False
+                if any(_CC_DASHRUN.search(c) for c in r):
+                    return False
+                if any(re.search(r"[A-Za-z].*[0-9]|[0-9].*[A-Za-z]", c) for c in r):
+                    return True
+                itemv = r[item_idx].strip() if item_idx < len(r) else ""
+                has_item = bool(re.search(r"\d", itemv))
+                has_desc = any(len(re.findall(r"[A-Za-z]{3,}", c)) >= 2 for c in r)
+                return has_item and has_desc
+            good = [r for r in rows if _row_ok(r)]
             # De-duplicate column names so the DataFrame is well-formed.
             seen: Dict[str, int] = {}
             uniq: List[str] = []
