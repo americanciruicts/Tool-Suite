@@ -2224,6 +2224,49 @@ def _split_pn_word_bleed(pn: str, desc: str) -> Tuple[str, str]:
     return pn, desc
 
 
+def _is_glued_pn_desc_column(values) -> bool:
+    """A column whose cells are '<part number> <description words>' — the part
+    number and the primary description share ONE column, as on some assembly
+    drawings (WheelRight Tread Camera: '023-0899-P01 Tread Camera Housing Case').
+    Detected when most multi-token cells start with a digit-bearing token followed
+    by >=2 real words, so a plain MPN / alternate-MPN column never qualifies."""
+    n = n_glued = 0
+    for v in values:
+        toks = str(v).split()
+        if len(toks) < 2:
+            continue
+        n += 1
+        words = sum(1 for t in toks[1:]
+                    if t.strip(",.;:()").isalpha() and len(t.strip(",.;:()")) >= 3)
+        if any(c.isdigit() for c in toks[0]) and words >= 2:
+            n_glued += 1
+    return n >= 3 and n_glued / n >= 0.4
+
+
+def _split_glued_pn_desc(pn: str, desc: str) -> Tuple[str, str]:
+    """Split a glued 'part number + description' cell: first token is the part
+    number, everything after it joins the front of the description."""
+    pn = (pn or "").strip()
+    toks = pn.split()
+    if len(toks) < 2 or not any(c.isdigit() for c in toks[0]):
+        return pn, desc
+    moved = " ".join(toks[1:])
+    desc = (moved + " " + desc).strip() if str(desc).strip() else moved
+    return toks[0], desc
+
+
+def _dedup_desc_phrase(desc) -> str:
+    """Collapse an immediately repeated phrase (case-insensitive): a drawing that
+    states the same description twice — once in the part-number column and once in
+    a description column ('Tread Camera Housing Case Tread camera housing case') —
+    keeps a single copy."""
+    w = str(desc).split()
+    n = len(w)
+    if n >= 2 and n % 2 == 0 and [x.lower() for x in w[:n // 2]] == [x.lower() for x in w[n // 2:]]:
+        return " ".join(w[:n // 2])
+    return desc
+
+
 def map_to_quote_template_schema(df: pd.DataFrame) -> pd.DataFrame:
     """
     Map an extracted table to the clean "BOM" tab layout
@@ -2306,12 +2349,20 @@ def map_to_quote_template_schema(df: pd.DataFrame) -> pd.DataFrame:
     _il = out.columns.get_loc("Item#")
     _pl = out.columns.get_loc("Mfg P/N")
     _dl0 = out.columns.get_loc("Description")
+    # A whole 'part number + description' column (drawing assembly lists) is split
+    # aggressively at the first token; otherwise only a stray trailing word that
+    # bled in is moved (so plain/alternate-MPN columns are left intact).
+    _glued_il = _is_glued_pn_desc_column(out["Item#"])
+    _glued_pl = _is_glued_pn_desc_column(out["Mfg P/N"])
     for _i in range(len(out)):
         _d = str(out.iat[_i, _dl0])
-        for _cl in (_il, _pl):
-            _newpn, _d = _split_pn_word_bleed(str(out.iat[_i, _cl]), _d)
+        for _cl, _glued in ((_il, _glued_il), (_pl, _glued_pl)):
+            if _glued:
+                _newpn, _d = _split_glued_pn_desc(str(out.iat[_i, _cl]), _d)
+            else:
+                _newpn, _d = _split_pn_word_bleed(str(out.iat[_i, _cl]), _d)
             out.iat[_i, _cl] = _newpn
-        out.iat[_i, _dl0] = _d
+        out.iat[_i, _dl0] = _dedup_desc_phrase(_d)
 
     # A Qty that bled into the description tail on the table's bottom row: the
     # drawing's border zone-labels overlap the last cells and push the count out
