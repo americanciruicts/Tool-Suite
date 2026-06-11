@@ -1902,10 +1902,11 @@ _NOISE_FRAGMENT_RE = re.compile(
 )
 # Inch dimension (7.00", .025") — stripped only from maker / part-number fields.
 _INCH_DIM_RE = re.compile(r'\b\d*\.?\d+\s*"')
-# Leader-callout junk tokens inside a part-number cell: a bare 1-2 digit number,
-# a single stray letter, or punctuation. NOT a multi-char token (which could be a
-# real part number — including an alternate MPN we must keep).
-_PN_JUNK_TOKEN_RE = re.compile(r'^(?:\d{1,2}|[A-Za-z]|[^0-9A-Za-z]+)$')
+# Leader-callout junk tokens inside a part-number cell: a bare 1-2 digit number, a
+# bare dimension decimal ('16.0', '24.0' — drawing callouts, never a part number),
+# a single stray letter, or punctuation. NOT a multi-char alphanumeric token (which
+# could be a real part number — including an alternate MPN we must keep).
+_PN_JUNK_TOKEN_RE = re.compile(r'^(?:\d{1,2}|\d+\.\d+|[A-Za-z]|[^0-9A-Za-z]+)$')
 
 
 def _is_doubled_ocr(tok: str) -> bool:
