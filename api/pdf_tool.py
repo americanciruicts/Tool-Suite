@@ -2289,13 +2289,16 @@ def map_to_quote_template_schema(df: pd.DataFrame) -> pd.DataFrame:
 
     item_src = _pick_item_number_source(df, chosen)
 
-    # A sole part column that is a house/internal number (3-group dashed numeric)
-    # with NO manufacturer column is the customer's item number, not a maker MPN
-    # (packaging BOMs: WiTricity '173-000022-01', cartons/fillers/labels). Surface
-    # it as Item# and leave Mfg P/N blank rather than mislabelling it the Mfg P/N.
+    # A sole part-number column with NO separate manufacturer column holds the
+    # COMPANY's own part number (WheelRight '023-0899-P01', WiTricity '173-000022-01'
+    # packaging parts), not a component maker's MPN. Surface it as Item# and leave
+    # Mfg P/N blank. Skip only when the column header explicitly names the
+    # manufacturer (then it genuinely is the Mfg P/N).
+    item_from_mpn = False
     if (item_src is None and "manufacturer" not in chosen and "mpn" in chosen
-            and _looks_like_house_pn(df[chosen["mpn"]].tolist())):
+            and not re.search(r"manufact|\bmfg\b|\bmfr\b", str(chosen["mpn"]), re.I)):
         item_src = chosen.pop("mpn")
+        item_from_mpn = True
 
     # Seed with df's index so scalar-filled columns span every source row (an
     # index-less frame would collapse to 0 rows when nothing maps from df).
@@ -2336,63 +2339,63 @@ def map_to_quote_template_schema(df: pd.DataFrame) -> pd.DataFrame:
 
     # Scrub drawing-callout noise that bled into the stakeholder cells, then drop
     # rows that are pure drawing noise (no real description and no part number).
-    keep = [not _is_drawing_junk_row(d, p) for d, p in zip(out["Description"], out["Mfg P/N"])]
+    # The part number may live in Item# (a company-PN BOM with a blank Mfg P/N), so
+    # a row with a real Item# part number is kept even when the others are empty.
+    keep = [(not _is_drawing_junk_row(d, p)) or _has_real_partno(it)
+            for d, p, it in zip(out["Description"], out["Mfg P/N"], out["Item#"])]
     out = out[keep].reset_index(drop=True)
     if out.empty:
         return pd.DataFrame(columns=BOM_OUTPUT_COLUMNS)
     out["Item#"] = out["Item#"].apply(_collapse_ws)
-
-    # Move a description word that the column slicer pulled into the part-number
-    # cell ('173-000022-01 CARTON' → PN '173-000022-01' + 'CARTON' to description)
-    # back where it belongs. Applies to whichever cell holds the number (Item# for
-    # a house-PN packaging BOM, else Mfg P/N).
-    # Item# is always cleaned to a bare identifier (a bled description word moves
-    # back to the description). The Mfg P/N is split out of a glued
-    # 'part number + description' cell ONLY when the source has NO separate
-    # description column — i.e. the description lives there and nowhere else. When a
-    # real Description column exists (e.g. Tread Camera), Mfg P/N is left faithful.
     _il = out.columns.get_loc("Item#")
     _pl = out.columns.get_loc("Mfg P/N")
-    _dl0 = out.columns.get_loc("Description")
-    split_mfgpn = "description" not in chosen and _is_glued_pn_desc_column(out["Mfg P/N"])
-    for _i in range(len(out)):
-        _newitem, _d = _split_pn_word_bleed(str(out.iat[_i, _il]), str(out.iat[_i, _dl0]))
-        out.iat[_i, _il] = _newitem
-        if split_mfgpn:
-            _newpn, _d = _split_glued_pn_desc(str(out.iat[_i, _pl]), _d)
-            out.iat[_i, _pl] = _newpn
-        out.iat[_i, _dl0] = _dedup_desc_phrase(_d)
-
-    # A Qty that bled into the description tail on the table's bottom row: the
-    # drawing's border zone-labels overlap the last cells and push the count out
-    # of the Qty column ('…375-SERIES, CLEAR 1.5 6 7 4 3 2 1' with Qty blank, the
-    # trailing '6 7 4 3 2 1' being drawing zones). Recover it only when Qty is
-    # blank and the description ends with '<qty> <run of 2+ single-digit zones>',
-    # so a description that simply ends in a number is left alone.
     _qloc = out.columns.get_loc("Qty")
-    _dloc = out.columns.get_loc("Description")
+    _dl0 = out.columns.get_loc("Description")
     _qty_col_exists = "qty" in chosen
+
+    # 1) Recover a Qty that bled into the description FIRST — before any part-number
+    #    text is folded into the description, so a short '… 12' / '10' tail is still
+    #    recognisable. Two shapes: a bottom-row drawing-zone bleed
+    #    ('…CLEAR 1.5 6 7 4 3 2 1'), and a plain trailing count that overflowed into
+    #    the description while the Qty cell is blank. The plain case is guarded
+    #    (count <=99, <=3 tokens left) so a spec/package code ('…10%, 0805') is never
+    #    mistaken for a quantity.
     for _i in range(len(out)):
         if str(out.iat[_i, _qloc]).strip():
             continue
-        s = _collapse_ws(out.iat[_i, _dloc])
+        s = _collapse_ws(out.iat[_i, _dl0])
         _m = _DESC_TAIL_QTY_RE.match(s)
         if _m:
             out.iat[_i, _qloc] = _m.group(2)
-            out.iat[_i, _dloc] = _m.group(1)
+            out.iat[_i, _dl0] = _m.group(1)
         elif _qty_col_exists:
-            # The count bled into the description and the Qty cell is blank
-            # (desc 'Tappex/KVT 073M5 12', or the cell is just '10'). Move a
-            # standalone trailing integer into Qty, but ONLY when it's a small count
-            # (<=99) AND little text is left behind (<=3 tokens) — a real component
-            # description is long and ends in a spec/package code ('…10%, 0805',
-            # '…EIA 7343'), which must NOT be mistaken for a quantity.
             _m2 = re.fullmatch(r"(?:(.*\S)\s+)?(\d{1,4})", s)
             if _m2 and 1 <= int(_m2.group(2)) <= 99:
                 _rest = (_m2.group(1) or "").strip()
                 if len(_rest.split()) <= 3:
                     out.iat[_i, _qloc] = _m2.group(2)
-                    out.iat[_i, _dloc] = _rest
+                    out.iat[_i, _dl0] = _rest
+
+    # 2) Reduce the part-number cell to a bare identifier and fold any glued
+    #    description text into the Description (deduped — a drawing that restates
+    #    the description in both columns collapses to one copy):
+    #    - Item# came from the part-number column → take the first token as the
+    #      identifier, the rest is description text.
+    #    - Item# came from a customer/house column → only a stray pure-word that bled
+    #      in is moved (a real identifier is left intact).
+    #    - Mfg P/N is split only when the source had NO separate Description column.
+    split_mfgpn = "description" not in chosen and _is_glued_pn_desc_column(out["Mfg P/N"])
+    for _i in range(len(out)):
+        _d = str(out.iat[_i, _dl0])
+        if item_from_mpn:
+            _newitem, _d = _split_glued_pn_desc(str(out.iat[_i, _il]), _d)
+        else:
+            _newitem, _d = _split_pn_word_bleed(str(out.iat[_i, _il]), _d)
+        out.iat[_i, _il] = _newitem
+        if split_mfgpn:
+            _newpn, _d = _split_glued_pn_desc(str(out.iat[_i, _pl]), _d)
+            out.iat[_i, _pl] = _newpn
+        out.iat[_i, _dl0] = _dedup_desc_phrase(_d)
 
     out["Description"] = out["Description"].apply(_clean_description_cell)
     out["Mfg"] = out["Mfg"].apply(_clean_mfg_cell)
@@ -2412,7 +2415,7 @@ def map_to_quote_template_schema(df: pd.DataFrame) -> pd.DataFrame:
     def _has(v) -> bool:
         return not _is_blank_cell(v)
 
-    mask = out["Mfg P/N"].apply(_has) | out["Description"].apply(_has)
+    mask = out["Mfg P/N"].apply(_has) | out["Description"].apply(_has) | out["Item#"].apply(_has)
     out = out[mask].reset_index(drop=True)
 
     # A per-designator placement list with NO quantities anywhere (one row per
