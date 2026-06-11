@@ -2371,13 +2371,28 @@ def map_to_quote_template_schema(df: pd.DataFrame) -> pd.DataFrame:
     # so a description that simply ends in a number is left alone.
     _qloc = out.columns.get_loc("Qty")
     _dloc = out.columns.get_loc("Description")
+    _qty_col_exists = "qty" in chosen
     for _i in range(len(out)):
         if str(out.iat[_i, _qloc]).strip():
             continue
-        _m = _DESC_TAIL_QTY_RE.match(_collapse_ws(out.iat[_i, _dloc]))
+        s = _collapse_ws(out.iat[_i, _dloc])
+        _m = _DESC_TAIL_QTY_RE.match(s)
         if _m:
             out.iat[_i, _qloc] = _m.group(2)
             out.iat[_i, _dloc] = _m.group(1)
+        elif _qty_col_exists:
+            # The count bled into the description and the Qty cell is blank
+            # (desc 'Tappex/KVT 073M5 12', or the cell is just '10'). Move a
+            # standalone trailing integer into Qty, but ONLY when it's a small count
+            # (<=99) AND little text is left behind (<=3 tokens) — a real component
+            # description is long and ends in a spec/package code ('…10%, 0805',
+            # '…EIA 7343'), which must NOT be mistaken for a quantity.
+            _m2 = re.fullmatch(r"(?:(.*\S)\s+)?(\d{1,4})", s)
+            if _m2 and 1 <= int(_m2.group(2)) <= 99:
+                _rest = (_m2.group(1) or "").strip()
+                if len(_rest.split()) <= 3:
+                    out.iat[_i, _qloc] = _m2.group(2)
+                    out.iat[_i, _dloc] = _rest
 
     out["Description"] = out["Description"].apply(_clean_description_cell)
     out["Mfg"] = out["Mfg"].apply(_clean_mfg_cell)
