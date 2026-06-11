@@ -2226,10 +2226,10 @@ def _split_pn_word_bleed(pn: str, desc: str) -> Tuple[str, str]:
 
 def _is_glued_pn_desc_column(values) -> bool:
     """A column whose cells are '<part number> <description words>' — the part
-    number and the primary description share ONE column, as on some assembly
-    drawings (WheelRight Tread Camera: '023-0899-P01 Tread Camera Housing Case').
-    Detected when most multi-token cells start with a digit-bearing token followed
-    by >=2 real words, so a plain MPN / alternate-MPN column never qualifies."""
+    number and the primary description share ONE column (assembly drawings with no
+    separate description column). Detected when most multi-token cells start with a
+    digit-bearing token followed by >=2 real words, so a plain MPN / alternate-MPN
+    column never qualifies."""
     n = n_glued = 0
     for v in values:
         toks = str(v).split()
@@ -2346,22 +2346,21 @@ def map_to_quote_template_schema(df: pd.DataFrame) -> pd.DataFrame:
     # cell ('173-000022-01 CARTON' → PN '173-000022-01' + 'CARTON' to description)
     # back where it belongs. Applies to whichever cell holds the number (Item# for
     # a house-PN packaging BOM, else Mfg P/N).
+    # Item# is always cleaned to a bare identifier (a bled description word moves
+    # back to the description). The Mfg P/N is split out of a glued
+    # 'part number + description' cell ONLY when the source has NO separate
+    # description column — i.e. the description lives there and nowhere else. When a
+    # real Description column exists (e.g. Tread Camera), Mfg P/N is left faithful.
     _il = out.columns.get_loc("Item#")
     _pl = out.columns.get_loc("Mfg P/N")
     _dl0 = out.columns.get_loc("Description")
-    # A whole 'part number + description' column (drawing assembly lists) is split
-    # aggressively at the first token; otherwise only a stray trailing word that
-    # bled in is moved (so plain/alternate-MPN columns are left intact).
-    _glued_il = _is_glued_pn_desc_column(out["Item#"])
-    _glued_pl = _is_glued_pn_desc_column(out["Mfg P/N"])
+    split_mfgpn = "description" not in chosen and _is_glued_pn_desc_column(out["Mfg P/N"])
     for _i in range(len(out)):
-        _d = str(out.iat[_i, _dl0])
-        for _cl, _glued in ((_il, _glued_il), (_pl, _glued_pl)):
-            if _glued:
-                _newpn, _d = _split_glued_pn_desc(str(out.iat[_i, _cl]), _d)
-            else:
-                _newpn, _d = _split_pn_word_bleed(str(out.iat[_i, _cl]), _d)
-            out.iat[_i, _cl] = _newpn
+        _newitem, _d = _split_pn_word_bleed(str(out.iat[_i, _il]), str(out.iat[_i, _dl0]))
+        out.iat[_i, _il] = _newitem
+        if split_mfgpn:
+            _newpn, _d = _split_glued_pn_desc(str(out.iat[_i, _pl]), _d)
+            out.iat[_i, _pl] = _newpn
         out.iat[_i, _dl0] = _dedup_desc_phrase(_d)
 
     # A Qty that bled into the description tail on the table's bottom row: the
