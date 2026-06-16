@@ -659,6 +659,12 @@ _CC_STOPLINE = re.compile(
     re.I,
 )
 _CC_DASHRUN = re.compile(r"[-]{8,}")
+# A "placeholder/marker" word that carries no BOM data: a lone dash (the report's
+# "ditto / not-applicable" filler on alternate-manufacturer continuation lines),
+# any dash variant, or a selection/check glyph (e.g. the caron "ˇ" prepended to
+# each primary row). These are dropped when assembling a cell so they never bleed
+# a stray "-" into Item Number / Revision / Quantity etc.
+_CC_JUNK_WORD = re.compile(r"^[-–—‐‑·•◦▪▫□☐■✓✔ˇˆ˜|¦]{1,3}$")
 
 
 def _cc_norm(t: str) -> str:
@@ -759,6 +765,12 @@ def parse_columnar_coords(pdf_path: str, max_pages: int = 8) -> Optional[pd.Data
     except Exception:
         return None
 
+    # Pass 1: collect every qualifying page's table region (header band + data
+    # lines). A multi-page report BOM repeats its header on every page; we parse
+    # them as ONE table using a single column layout (below) so continuation
+    # pages align to the same columns instead of being silently dropped — the old
+    # code returned the first page only, losing pages 2..N of a multi-page BOM.
+    pages_data: List[Dict] = []
     with pdf:
         for page in pdf.pages[:max_pages]:
             try:
@@ -791,112 +803,128 @@ def parse_columnar_coords(pdf_path: str, max_pages: int = 8) -> Optional[pd.Data
                 ylines.append(ln)
             if len(ylines) < 3:
                 continue
+            pages_data.append({"band": band, "x_lo": x_lo, "x_hi": x_hi,
+                               "ylines": ylines})
 
-            cuts = _cc_column_starts(ylines, x_lo, x_hi)
-            if not cuts or len(cuts) < 3:
-                continue
-            names = _cc_name_columns(cuts, band)
-            ncol = len(names)
+    if not pages_data:
+        return None
 
-            def colof(w):
-                cx = w["x0"] + 1
-                if cx < cuts[0]:
-                    return 0
-                for i in range(len(cuts) - 1):
-                    if cuts[i] <= cx < cuts[i + 1]:
-                        return i
-                return ncol - 1
+    # Detect the column layout ONCE, from the first page (the table's reference
+    # layout — its full-width descriptions keep the maker and part-number columns
+    # apart), and reuse it for every page so columns line up consistently across
+    # pages instead of each continuation page re-deriving its own edges.
+    primary = pages_data[0]
+    cuts = _cc_column_starts(primary["ylines"], primary["x_lo"], primary["x_hi"])
+    if not cuts or len(cuts) < 3:
+        return None
+    names = _cc_name_columns(cuts, primary["band"])
+    ncol = len(names)
 
-            # The item/anchor column defines row boundaries: a column whose header
-            # names item/line/no — NOT 'Part Number'/'Mfg Part Num' (those are the
-            # MPN). Matching 'part' anchored rows on the MPN, so a line item with a
-            # blank MPN (e.g. a PWB sub-assembly) merged into the row above it.
-            # Fall back to the leftmost column, which carries the line's item no.
-            item_idx = next(
-                (i for i, nm in enumerate(names)
-                 if re.search(r"\bitem\b|\bline\b|^no\.?$", nm.lower())), 0)
+    def colof(w):
+        cx = w["x0"] + 1
+        if cx < cuts[0]:
+            return 0
+        for i in range(len(cuts) - 1):
+            if cuts[i] <= cx < cuts[i + 1]:
+                return i
+        return ncol - 1
 
-            rows: List[List[str]] = []
-            for ln in ylines:
-                cells = ["" for _ in range(ncol)]
-                for w in sorted(ln, key=lambda w: w["x0"]):
-                    ci = colof(w)
-                    if ci is None:
-                        continue
-                    cells[ci] = (cells[ci] + " " + w["text"]).strip()
-                itemval = cells[item_idx].strip()
-                is_anchor = (bool(itemval) and bool(re.search(r"[0-9]", itemval))
-                             and len(itemval.split()) <= 2)
-                nonempty = sum(1 for c in cells if c.strip())
-                if is_anchor or not rows:
-                    if nonempty >= 2:
-                        rows.append(cells)
-                else:
-                    prev = rows[-1]
-                    for i in range(ncol):
-                        if cells[i].strip():
-                            prev[i] = ((prev[i] + " " + cells[i]).strip()
-                                       if prev[i].strip() else cells[i])
+    # The item/anchor column defines row boundaries: a column whose header
+    # names item/line/no — NOT 'Part Number'/'Mfg Part Num' (those are the
+    # MPN). Matching 'part' anchored rows on the MPN, so a line item with a
+    # blank MPN (e.g. a PWB sub-assembly) merged into the row above it.
+    # Fall back to the leftmost column, which carries the line's item no.
+    item_idx = next(
+        (i for i, nm in enumerate(names)
+         if re.search(r"\bitem\b|\bline\b|^no\.?$", nm.lower())), 0)
 
-            # --- column post-processing -------------------------------------
-            # Merge interior unnamed ("Column N") columns into the previous real
-            # column (a narrow data river inside one logical cell).
-            def _unnamed(nm):
-                return bool(re.match(r"Column \d+$", nm))
-            merged_names: List[str] = []
-            keep_map: List[List[int]] = []
-            for j, nm in enumerate(names):
-                if _unnamed(nm) and merged_names:
-                    keep_map[-1].append(j)
-                else:
-                    merged_names.append(nm)
-                    keep_map.append([j])
+    # Pass 2: build rows across ALL pages with the shared column layout. Lines
+    # stream in page order, so an alternate-manufacturer continuation that spills
+    # onto the next page still merges into its item row.
+    rows: List[List[str]] = []
+    for d in pages_data:
+        for ln in d["ylines"]:
+            cells = ["" for _ in range(ncol)]
+            for w in sorted(ln, key=lambda w: w["x0"]):
+                ci = colof(w)
+                if ci is None:
+                    continue
+                if _CC_JUNK_WORD.match(w["text"]):
+                    continue  # drop dash placeholders / row-marker glyphs
+                cells[ci] = (cells[ci] + " " + w["text"]).strip()
+            itemval = cells[item_idx].strip()
+            is_anchor = (bool(itemval) and bool(re.search(r"[0-9]", itemval))
+                         and len(itemval.split()) <= 2)
+            nonempty = sum(1 for c in cells if c.strip())
+            if is_anchor or not rows:
+                if nonempty >= 2:
+                    rows.append(cells)
+            else:
+                prev = rows[-1]
+                for i in range(ncol):
+                    if cells[i].strip():
+                        prev[i] = ((prev[i] + " " + cells[i]).strip()
+                                   if prev[i].strip() else cells[i])
 
-            def _join(cells, idxs):
-                return " ".join(cells[k] for k in idxs if cells[k].strip()).strip()
-            rows = [[_join(r, idxs) for idxs in keep_map] for r in rows]
-            names = merged_names
-            # Drop columns empty across all rows.
-            nz = [any(r[c].strip() for r in rows) for c in range(len(names))]
-            names = [names[c] for c in range(len(names)) if nz[c]]
-            rows = [[r[c] for c in range(len(nz)) if nz[c]] for r in rows]
-            if len(names) < 2:
-                continue
-            # Order-preserving token dedup per cell (collapses alt-source repeats
-            # merged from continuation lines, e.g. "AUSTRIA AUSTRIA").
-            def _dedup(cell):
-                seen = set()
-                out = []
-                for t in cell.split():
-                    if t not in seen:
-                        seen.add(t)
-                        out.append(t)
-                return " ".join(out)
-            rows = [[_dedup(c) for c in r] for r in rows]
-            # Keep component rows: >=3 filled cells, no long dash run (drops
-            # assembly-title / separator lines), and a real line identity — either
-            # a part-number-ish alphanumeric cell, OR (for a no-MPN line item like
-            # a PWB sub-assembly) an item-number value plus a worded description.
-            def _row_ok(r: List[str]) -> bool:
-                if sum(1 for c in r if c.strip()) < 3:
-                    return False
-                if any(_CC_DASHRUN.search(c) for c in r):
-                    return False
-                if any(re.search(r"[A-Za-z].*[0-9]|[0-9].*[A-Za-z]", c) for c in r):
-                    return True
-                itemv = r[item_idx].strip() if item_idx < len(r) else ""
-                has_item = bool(re.search(r"\d", itemv))
-                has_desc = any(len(re.findall(r"[A-Za-z]{3,}", c)) >= 2 for c in r)
-                return has_item and has_desc
-            good = [r for r in rows if _row_ok(r)]
-            # De-duplicate column names so the DataFrame is well-formed.
-            seen: Dict[str, int] = {}
-            uniq: List[str] = []
-            for nm in names:
-                seen[nm] = seen.get(nm, 0) + 1
-                uniq.append(nm if seen[nm] == 1 else f"{nm} ({seen[nm]})")
-            if len(good) >= 3:
-                return pd.DataFrame(good, columns=uniq)
+    # --- column post-processing -----------------------------------------
+    # Merge interior unnamed ("Column N") columns into the previous real
+    # column (a narrow data river inside one logical cell).
+    def _unnamed(nm):
+        return bool(re.match(r"Column \d+$", nm))
+    merged_names: List[str] = []
+    keep_map: List[List[int]] = []
+    for j, nm in enumerate(names):
+        if _unnamed(nm) and merged_names:
+            keep_map[-1].append(j)
+        else:
+            merged_names.append(nm)
+            keep_map.append([j])
+
+    def _join(cells, idxs):
+        return " ".join(cells[k] for k in idxs if cells[k].strip()).strip()
+    rows = [[_join(r, idxs) for idxs in keep_map] for r in rows]
+    names = merged_names
+    # Drop columns empty across all rows.
+    nz = [any(r[c].strip() for r in rows) for c in range(len(names))]
+    names = [names[c] for c in range(len(names)) if nz[c]]
+    rows = [[r[c] for c in range(len(nz)) if nz[c]] for r in rows]
+    if len(names) < 2:
+        return None
+    # Order-preserving token dedup per cell (collapses alt-source repeats
+    # merged from continuation lines, e.g. "AUSTRIA AUSTRIA").
+    def _dedup(cell):
+        seen = set()
+        out = []
+        for t in cell.split():
+            if t not in seen:
+                seen.add(t)
+                out.append(t)
+        return " ".join(out)
+    rows = [[_dedup(c) for c in r] for r in rows]
+    # Keep component rows: >=3 filled cells, no long dash run (drops
+    # assembly-title / separator lines), and a real line identity — either
+    # a part-number-ish alphanumeric cell, OR (for a no-MPN line item like
+    # a PWB sub-assembly) an item-number value plus a worded description.
+    def _row_ok(r: List[str]) -> bool:
+        if sum(1 for c in r if c.strip()) < 3:
+            return False
+        if any(_CC_DASHRUN.search(c) for c in r):
+            return False
+        if any(re.search(r"[A-Za-z].*[0-9]|[0-9].*[A-Za-z]", c) for c in r):
+            return True
+        itemv = r[item_idx].strip() if item_idx < len(r) else ""
+        has_item = bool(re.search(r"\d", itemv))
+        has_desc = any(len(re.findall(r"[A-Za-z]{3,}", c)) >= 2 for c in r)
+        return has_item and has_desc
+    good = [r for r in rows if _row_ok(r)]
+    # De-duplicate column names so the DataFrame is well-formed.
+    seen: Dict[str, int] = {}
+    uniq: List[str] = []
+    for nm in names:
+        seen[nm] = seen.get(nm, 0) + 1
+        uniq.append(nm if seen[nm] == 1 else f"{nm} ({seen[nm]})")
+    if len(good) >= 3:
+        return pd.DataFrame(good, columns=uniq)
     return None
 
 

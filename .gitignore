@@ -119,3 +119,4 @@ htmlcov/
 !postcss.config.js
 !docker-compose.yml
 .vercel
+*.pyc
